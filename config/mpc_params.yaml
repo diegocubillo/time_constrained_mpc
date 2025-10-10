@@ -1,0 +1,34 @@
+mpc_controller:
+  ros__parameters:
+    # MPC Configuration
+    controller_frequency: 10.0  # Hz
+    horizon_sec: 2.0            # seconds
+    horizon_steps: 10           # prediction steps
+    
+    # Velocity Limits
+    max_linear_vel: 0.5         # m/s
+    max_angular_vel: 1.0        # rad/s
+    
+    # Lookahead Configuration
+    lookahead_time: 1.5         # seconds
+    min_lookahead_dist: 0.3     # meters
+    max_lookahead_dist: 0.9     # meters
+    
+    # Goal Tolerances
+    goal_dist_tolerance: 0.2    # meters
+    goal_theta_tolerance: 0.1   # radians
+    
+    # MPC Cost Weights
+    # State tracking weights [x, y, theta]
+    Q_matrix_diag: [10.0, 10.0, 1.0]
+    
+    # Control effort weights [v, omega]
+    R_matrix_diag: [1.0, 1.0]
+    
+    # Control rate weights [dv, domega]
+    R_d_matrix_diag: [10.0, 10.0]
+    
+    # Frame IDs
+    map_frame: "map"
+    base_frame: "base_link"
+    odom_frame: "odom"

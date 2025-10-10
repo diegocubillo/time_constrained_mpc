@@ -1,0 +1,33 @@
+# Nav2 Parameters for MPC Controller Integration
+# This file contains all necessary parameters for running Nav2 with the MPC controller
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    yaml_filename: ""  # Will be set in launch file
+
+lifecycle_manager:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    node_names: ['map_server', 'planner_server', 'mpc_controller']
+
+# Loopback simulator parameters
+loopback_simulator:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    map_frame_id: "map"
+    scan_frame_id: "base_scan"
+    update_duration: 0.01

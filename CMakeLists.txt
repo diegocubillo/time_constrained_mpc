@@ -14,12 +14,18 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(osqp REQUIRED)
 
-add_executable(time_constrained_mpc src/time_constrained_mpc.cpp)
+add_executable(time_constrained_mpc 
+  src/time_constrained_mpc.cpp
+  src/main.cpp)
 target_include_directories(time_constrained_mpc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:include>
+  ${EIGEN3_INCLUDE_DIR})
 target_compile_features(time_constrained_mpc PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 
 # Link dependencies
@@ -31,11 +37,29 @@ ament_target_dependencies(time_constrained_mpc
   nav_msgs
   nav2_msgs
   tf2_ros
+  tf2_geometry_msgs
   nav2_costmap_2d
+  Eigen3
+)
+
+target_link_libraries(time_constrained_mpc
+  osqp::osqp
 )
 
 install(TARGETS time_constrained_mpc
   DESTINATION lib/${PROJECT_NAME})
+
+# Install launch files
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+
+# Install config files
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME})
+
+# Install maps
+install(DIRECTORY maps
+  DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
