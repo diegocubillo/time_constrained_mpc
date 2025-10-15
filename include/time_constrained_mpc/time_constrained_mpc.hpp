@@ -19,6 +19,7 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "bondcpp/bond.hpp"
 #include "osqp/osqp.h"
 
 using GoalHandleFollowPath = rclcpp_action::ServerGoalHandle<nav2_msgs::action::FollowPath>;
@@ -78,6 +79,11 @@ public:
   bool goal_reached(const geometry_msgs::msg::PoseStamped &pose, const nav_msgs::msg::Path &path);
   void reset_state();
 
+  // Bond management
+  void create_bond();
+  void destroy_bond();
+  void bond_timeout_callback();
+
 private:
   // Helper methods for MPC
   Eigen::Vector2d differential_drive_model(const Eigen::Vector3d &state, 
@@ -102,6 +108,11 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp_action::Server<nav2_msgs::action::FollowPath>::SharedPtr action_server_;
   std::shared_ptr<GoalHandleFollowPath> current_goal_handle_;
+  
+  // Bond for heartbeat monitoring
+  std::unique_ptr<bond::Bond> bond_;
+  std::string bond_id_;
+  bool bond_timeout_detected_{false};
   
   // State variables
   nav_msgs::msg::Path global_plan_;

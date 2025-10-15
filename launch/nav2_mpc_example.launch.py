@@ -17,7 +17,7 @@ Usage:
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, LifecycleNode
@@ -127,6 +127,18 @@ def generate_launch_description():
         condition=IfCondition(use_rviz),
         output='screen')
 
+    # Initial pose publisher (for testing purposes)
+    publish_initial_pose = TimerAction(
+        period=2.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'topic', 'pub', '--once', '/initialpose', 'geometry_msgs/msg/PoseWithCovarianceStamped', '"{header: {frame_id: "map"}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}"'],
+                shell=True,
+                output='screen'
+            )
+        ]
+    )
+
     # Create the launch description
     ld = LaunchDescription()
 
@@ -142,5 +154,6 @@ def generate_launch_description():
     ld.add_action(lifecycle_manager_node)
     ld.add_action(loopback_simulator_node)
     ld.add_action(rviz_node)
+    ld.add_action(publish_initial_pose)
 
     return ld

@@ -8,6 +8,8 @@ namespace mpc_controller
 MPCController::MPCController()
 : rclcpp_lifecycle::LifecycleNode("mpc_controller")
 {
+  // Initialize bond ID to match what Nav2 lifecycle manager expects
+  bond_id_ = get_name();
 }
 
 MPCController::~MPCController() = default;
@@ -34,6 +36,9 @@ MPCController::on_configure(const rclcpp_lifecycle::State & state)
   map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
   base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
   odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
+  
+  // Create bond
+  create_bond();
   
   // Control time step
   double controller_frequency = this->declare_parameter<double>("controller_frequency", 10.0);
@@ -112,6 +117,11 @@ MPCController::on_activate(const rclcpp_lifecycle::State & state)
   path_pub_->on_activate();
   cmd_vel_pub_->on_activate();
 
+  // Bond should already be started from on_configure
+  if (bond_) {
+    RCLCPP_INFO(get_logger(), "Bond is active with ID: %s", bond_id_.c_str());
+  }
+
   // Start main control loop timer
   timer_control_loop_ = this->create_wall_timer(
     std::chrono::milliseconds(100),
@@ -140,6 +150,12 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & state)
     timer_path_pub_->cancel();
   }
 
+  // Stop bond
+  if (bond_) {
+    // Bond will be automatically destroyed, no explicit shutdown needed
+    RCLCPP_INFO(get_logger(), "Bond stopped");
+  }
+
   // Disable the controller - stop accepting goals
   initialized_ = false;
   
@@ -156,6 +172,10 @@ MPCController::on_cleanup(const rclcpp_lifecycle::State & state)
   path_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  
+  // Destroy bond
+  destroy_bond();
+  
   RCLCPP_INFO(get_logger(), "MPCController on_cleanup() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
@@ -166,6 +186,10 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & state)
   path_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  
+  // Destroy bond
+  destroy_bond();
+  
   RCLCPP_INFO(get_logger(), "MPCController on_shutdown() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
@@ -211,6 +235,16 @@ void MPCController::handle_cancel(const std::shared_ptr<GoalHandleFollowPath> go
 void MPCController::control_loop()
 {
   if (!initialized_ || global_plan_.poses.empty()) {
+    return;
+  }
+
+  // Check bond status
+  if (bond_timeout_detected_) {
+    RCLCPP_ERROR(get_logger(), "Bond timeout detected! Stopping robot for safety.");
+    geometry_msgs::msg::Twist stop_cmd;
+    stop_cmd.linear.x = 0.0;
+    stop_cmd.angular.z = 0.0;
+    publish_velocity_command(stop_cmd);
     return;
   }
 
@@ -711,6 +745,60 @@ void MPCController::build_mpc_matrices(
     u(dim_u * N + dim_u * i) = 0.2;
     l(dim_u * N + dim_u * i + 1) = -0.3;
     u(dim_u * N + dim_u * i + 1) = 0.3;
+  }
+}
+
+// ----- BOND MANAGEMENT -----
+void MPCController::create_bond()
+{
+  try {
+    // Create bond with the topic name that Nav2 lifecycle manager expects
+    // Nav2 expects the bond to be on topic "bond" with ID matching the node name
+    bond_ = std::make_unique<bond::Bond>(
+      std::string("bond"),  // topic namespace - Nav2 default
+      bond_id_,             // bond ID should be the node name
+      shared_from_this(),   // lifecycle node shared pointer
+      [this]() { 
+        RCLCPP_INFO(get_logger(), "Bond broken callback triggered");
+        bond_timeout_callback(); 
+      },  // broken callback
+      [this]() { 
+        RCLCPP_INFO(get_logger(), "Bond formed successfully");
+      }  // formed callback
+    );
+    
+    // Start the bond immediately - Nav2 expects this
+    bond_->start();
+    
+    RCLCPP_INFO(get_logger(), "Bond created and started with ID: %s on topic: bond", bond_id_.c_str());
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(get_logger(), "Failed to create bond: %s", e.what());
+  }
+}
+
+void MPCController::destroy_bond()
+{
+  if (bond_) {
+    bond_.reset();
+    RCLCPP_INFO(get_logger(), "Bond destroyed");
+  }
+}
+
+void MPCController::bond_timeout_callback()
+{
+  RCLCPP_ERROR(get_logger(), "Bond connection broken! Communication with lifecycle manager lost.");
+  bond_timeout_detected_ = true;
+  
+  // Stop the robot for safety
+  if (initialized_) {
+    RCLCPP_WARN(get_logger(), "Stopping robot due to bond failure");
+    geometry_msgs::msg::Twist stop_cmd;
+    stop_cmd.linear.x = 0.0;
+    stop_cmd.angular.z = 0.0;
+    publish_velocity_command(stop_cmd);
+    
+    // Cancel current goal if active
+    reset_state();
   }
 }
 

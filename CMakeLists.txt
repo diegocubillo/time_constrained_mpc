@@ -18,6 +18,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(osqp REQUIRED)
+find_package(bondcpp REQUIRED)
 
 add_executable(time_constrained_mpc 
   src/time_constrained_mpc.cpp
@@ -40,6 +41,7 @@ ament_target_dependencies(time_constrained_mpc
   tf2_geometry_msgs
   nav2_costmap_2d
   Eigen3
+  bondcpp
 )
 
 target_link_libraries(time_constrained_mpc

@@ -30,4 +30,6 @@ loopback_simulator:
     odom_frame_id: "odom"
     map_frame_id: "map"
     scan_frame_id: "base_scan"
+    enable_stamped_cmd_vel: false
+    publish_map_odom_tf: true
     update_duration: 0.01
