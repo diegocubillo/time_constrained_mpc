@@ -97,7 +97,12 @@ class PathFollowerExample(Node):
             goal_msg, feedback_callback=self.feedback_callback)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
-    def send_sine_path(self, amplitude=1.0, wavelength=2.0, length=8.0, num_points=40):
+    def send_sine_path(
+            self,
+            amplitude=1.0,
+            wavelength=2.0,
+            length=8.0,
+            num_points=40):
         """Send a sine wave path to the controller"""
 
         # Wait for action server
@@ -121,8 +126,10 @@ class PathFollowerExample(Node):
             pose.pose.position.z = 0.0
 
             # Orientation tangent to the sine wave
-            yaw = math.atan2(
-                amplitude * (2 * math.pi / wavelength) * math.cos(2 * math.pi * x / wavelength), 1.0)
+            dx = 1.0
+            dy = (amplitude * (2 * math.pi / wavelength) *
+                  math.cos(2 * math.pi * x / wavelength))
+            yaw = math.atan2(dy, dx)
             pose.pose.orientation.z = math.sin(yaw / 2)
             pose.pose.orientation.w = math.cos(yaw / 2)
 
@@ -171,8 +178,11 @@ def main(args=None):
     # Choose which path to send:
     # node.send_circular_path(radius=2.0, num_points=20)
     # node.send_line_path(length=8.0, num_points=16)
-    node.send_sine_path(amplitude=1.0, wavelength=2.0, length=8.0, num_points=40)
-
+    node.send_sine_path(
+        amplitude=1.0,
+        wavelength=2.0,
+        length=8.0,
+        num_points=40)
 
     try:
         rclpy.spin(node)

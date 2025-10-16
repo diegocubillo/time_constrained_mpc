@@ -27,7 +27,8 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('time_constrained_mpc')
 
     # Paths to configuration files
-    example_params_file = os.path.join(pkg_dir, 'config', 'example_params.yaml')
+    example_params_file = os.path.join(
+        pkg_dir, 'config', 'example_params.yaml')
     mpc_params_file = os.path.join(pkg_dir, 'config', 'mpc_params.yaml')
     map_file = os.path.join(pkg_dir, 'maps', 'map.yaml')
     rviz_config_file = os.path.join(pkg_dir, 'config', 'example_view.rviz')
@@ -99,20 +100,29 @@ def generate_launch_description():
         parameters=[configured_params])
 
     # RViz2
+    rviz_args = ['-d', rviz_config_file] if os.path.exists(
+        rviz_config_file) else []
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
-        arguments=['-d', rviz_config_file] if os.path.exists(rviz_config_file) else [],
+        arguments=rviz_args,
         condition=IfCondition(use_rviz),
         output='screen')
 
     # Initial pose publisher (for testing purposes)
+    initial_pose_cmd = [
+        'ros2', 'topic', 'pub', '--once', '/initialpose',
+        'geometry_msgs/msg/PoseWithCovarianceStamped',
+        '"{header: {frame_id: "map"}, '
+        'pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, '
+        'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}"'
+    ]
     publish_initial_pose = TimerAction(
         period=2.0,
         actions=[
             ExecuteProcess(
-                cmd=['ros2', 'topic', 'pub', '--once', '/initialpose', 'geometry_msgs/msg/PoseWithCovarianceStamped', '"{header: {frame_id: "map"}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}"'],
+                cmd=initial_pose_cmd,
                 shell=True,
                 output='screen'
             )
@@ -122,11 +132,15 @@ def generate_launch_description():
     # Path to follow (for testing purposes)
     # This can be replaced with a more complex path publisher or action client
     # that sends a path to the MPC controller.
+    path_cmd = [
+        'ros2', 'run', 'time_constrained_mpc',
+        'send_example_path.py'
+    ]
     publish_path = TimerAction(
         period=5.0,
         actions=[
             ExecuteProcess(
-                cmd=['ros2', 'run', 'time_constrained_mpc', 'send_example_path.py'],
+                cmd=path_cmd,
                 shell=True,
                 output='screen'
             )

@@ -30,7 +30,8 @@ def generate_launch_description():
     # Event to configure the node
     configure_event = EmitEvent(
         event=ChangeState(
-            lifecycle_node_matcher=lambda node: node.name == 'mpc_controller',
+            lifecycle_node_matcher=(
+                lambda node: node.name == 'mpc_controller'),
             transition_id=Transition.TRANSITION_CONFIGURE,
         )
     )
