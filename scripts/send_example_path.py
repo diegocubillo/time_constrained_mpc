@@ -97,6 +97,50 @@ class PathFollowerExample(Node):
             goal_msg, feedback_callback=self.feedback_callback)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
+    def send_sine_path(self, amplitude=1.0, wavelength=2.0, length=8.0, num_points=40):
+        """Send a sine wave path to the controller"""
+
+        # Wait for action server
+        self.get_logger().info('Waiting for action server...')
+        self._action_client.wait_for_server()
+
+        # Create path
+        path = Path()
+        path.header.frame_id = 'map'
+        path.header.stamp = self.get_clock().now().to_msg()
+
+        # Generate sine wave path
+        for i in range(num_points):
+            x = length * i / (num_points - 1)
+            y = amplitude * math.sin(2 * math.pi * x / wavelength)
+
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+
+            # Orientation tangent to the sine wave
+            yaw = math.atan2(
+                amplitude * (2 * math.pi / wavelength) * math.cos(2 * math.pi * x / wavelength), 1.0)
+            pose.pose.orientation.z = math.sin(yaw / 2)
+            pose.pose.orientation.w = math.cos(yaw / 2)
+
+            path.poses.append(pose)
+
+        # Create goal
+        goal_msg = FollowPath.Goal()
+        goal_msg.path = path
+
+        self.get_logger().info(
+            f'Sending sine wave path with {len(path.poses)} poses'
+            )
+
+        # Send goal
+        self._send_goal_future = self._action_client.send_goal_async(
+            goal_msg, feedback_callback=self.feedback_callback)
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -126,7 +170,9 @@ def main(args=None):
 
     # Choose which path to send:
     # node.send_circular_path(radius=2.0, num_points=20)
-    node.send_line_path(length=3.0, num_points=15)
+    # node.send_line_path(length=8.0, num_points=16)
+    node.send_sine_path(amplitude=1.0, wavelength=2.0, length=8.0, num_points=40)
+
 
     try:
         rclpy.spin(node)

@@ -102,7 +102,8 @@ private:
   std::shared_ptr<rclcpp::TimerBase> timer_path_pub_;
   std::shared_ptr<rclcpp::TimerBase> timer_control_loop_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -132,6 +133,7 @@ private:
   double max_lookahead_dist_;
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
+  bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
   
   // MPC weight matrices
   Eigen::Matrix3d Q_;  // State error weight

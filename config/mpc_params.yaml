@@ -5,6 +5,9 @@ mpc_controller:
     horizon_sec: 2.0            # seconds
     horizon_steps: 10           # prediction steps
     
+    # Command Velocity Message Type
+    use_stamped_cmd_vel: false   # true: TwistStamped, false: Twist
+    
     # Velocity Limits
     max_linear_vel: 0.5         # m/s
     max_angular_vel: 1.0        # rad/s

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Complete Nav2 integration launch file with MPC controller.
+Complete path following launch file example with MPC controller.
 
 This launch file sets up:
-- Map server with a simple test map
-- Nav2 planner (NavFn by default)
 - MPC controller (our custom controller)
 - Loopback simulator for testing without a real robot
 - Lifecycle manager to manage all nodes
 - RViz2 for visualization
 
 Usage:
-    ros2 launch time_constrained_mpc nav2_mpc_example.launch.py
+    ros2 launch time_constrained_mpc mpc_example.launch.py
 """
 
 import os
@@ -29,10 +27,10 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('time_constrained_mpc')
 
     # Paths to configuration files
-    nav2_params_file = os.path.join(pkg_dir, 'config', 'nav2_params.yaml')
+    example_params_file = os.path.join(pkg_dir, 'config', 'example_params.yaml')
     mpc_params_file = os.path.join(pkg_dir, 'config', 'mpc_params.yaml')
     map_file = os.path.join(pkg_dir, 'maps', 'map.yaml')
-    rviz_config_file = os.path.join(pkg_dir, 'config', 'nav2_view.rviz')
+    rviz_config_file = os.path.join(pkg_dir, 'config', 'example_view.rviz')
 
     # Launch arguments
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -47,16 +45,16 @@ def generate_launch_description():
     declare_autostart_cmd = DeclareLaunchArgument(
         'autostart',
         default_value='true',
-        description='Automatically startup the nav2 stack')
+        description='Automatically startup the lifecycle nodes')
 
     declare_use_rviz_cmd = DeclareLaunchArgument(
         'use_rviz',
         default_value='true',
         description='Whether to start RViz2')
 
-    # Configure Nav2 parameters with map file path
+    # Configure yaml parameters
     configured_params = RewrittenYaml(
-        source_file=nav2_params_file,
+        source_file=example_params_file,
         root_key='',
         param_rewrites={
             'yaml_filename': map_file,
@@ -75,15 +73,6 @@ def generate_launch_description():
         output='screen',
         parameters=[configured_params])
 
-    # Planner server
-    planner_server_node = LifecycleNode(
-        package='nav2_planner',
-        executable='planner_server',
-        name='planner_server',
-        namespace='',
-        output='screen',
-        parameters=[configured_params])
-
     # Our MPC Controller
     mpc_controller_node = LifecycleNode(
         package='time_constrained_mpc',
@@ -98,17 +87,8 @@ def generate_launch_description():
     lifecycle_manager_node = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
-        name='lifecycle_manager_navigation',
-        output='screen',
-        parameters=[
-            {'use_sim_time': use_sim_time},
-            {'autostart': autostart},
-            {'node_names': [
-                'map_server',
-                'planner_server',
-                'mpc_controller'
-            ]}
-        ])
+        name='lifecycle_manager',
+        parameters=[configured_params])
 
     # Loopback simulator - simulates robot motion for testing
     loopback_simulator_node = Node(
@@ -139,6 +119,20 @@ def generate_launch_description():
         ]
     )
 
+    # Path to follow (for testing purposes)
+    # This can be replaced with a more complex path publisher or action client
+    # that sends a path to the MPC controller.
+    publish_path = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'run', 'time_constrained_mpc', 'send_example_path.py'],
+                shell=True,
+                output='screen'
+            )
+        ]
+    )
+
     # Create the launch description
     ld = LaunchDescription()
 
@@ -149,11 +143,11 @@ def generate_launch_description():
 
     # Add nodes
     ld.add_action(map_server_node)
-    ld.add_action(planner_server_node)
     ld.add_action(mpc_controller_node)
     ld.add_action(lifecycle_manager_node)
     ld.add_action(loopback_simulator_node)
     ld.add_action(rviz_node)
     ld.add_action(publish_initial_pose)
+    ld.add_action(publish_path)
 
     return ld

@@ -18,7 +18,18 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_configure(const rclcpp_lifecycle::State & state)
 {
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_debug_path", 10);
-  cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel", 10);
+  
+  // Determine which type of cmd_vel to use
+  use_stamped_cmd_vel_ = this->declare_parameter<bool>("use_stamped_cmd_vel", false);
+  
+  // Create the appropriate publisher based on the parameter
+  if (use_stamped_cmd_vel_) {
+    cmd_vel_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel", 10);
+    RCLCPP_INFO(get_logger(), "Using TwistStamped for cmd_vel");
+  } else {
+    cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+    RCLCPP_INFO(get_logger(), "Using Twist for cmd_vel");
+  }
 
   // Parameters
   max_linear_vel_ = this->declare_parameter<double>("max_linear_vel", 0.5);
@@ -115,7 +126,13 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_activate(const rclcpp_lifecycle::State & state)
 {
   path_pub_->on_activate();
-  cmd_vel_pub_->on_activate();
+  
+  // Activate the appropriate cmd_vel publisher
+  if (use_stamped_cmd_vel_) {
+    cmd_vel_stamped_pub_->on_activate();
+  } else {
+    cmd_vel_pub_->on_activate();
+  }
 
   // Bond should already be started from on_configure
   if (bond_) {
@@ -144,7 +161,13 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_deactivate(const rclcpp_lifecycle::State & state)
 {
   path_pub_->on_deactivate();
-  cmd_vel_pub_->on_deactivate();
+  
+  // Deactivate the appropriate cmd_vel publisher
+  if (use_stamped_cmd_vel_) {
+    cmd_vel_stamped_pub_->on_deactivate();
+  } else {
+    cmd_vel_pub_->on_deactivate();
+  }
 
   if (timer_path_pub_) {
     timer_path_pub_->cancel();
@@ -170,6 +193,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_cleanup(const rclcpp_lifecycle::State & state)
 {
   path_pub_.reset();
+  cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
   
@@ -184,6 +208,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_shutdown(const rclcpp_lifecycle::State & state)
 {
   path_pub_.reset();
+  cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
   
@@ -525,11 +550,17 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
 // ----- COMMAND PUBLICATION -----
 void MPCController::publish_velocity_command(const geometry_msgs::msg::Twist &cmd)
 {
-  geometry_msgs::msg::TwistStamped cmd_stamped;
-  cmd_stamped.header.stamp = this->now();
-  cmd_stamped.header.frame_id = "base_link";
-  cmd_stamped.twist = cmd;
-  cmd_vel_pub_->publish(cmd_stamped);
+  if (use_stamped_cmd_vel_) {
+    // Publish TwistStamped
+    geometry_msgs::msg::TwistStamped cmd_stamped;
+    cmd_stamped.header.stamp = this->now();
+    cmd_stamped.header.frame_id = "base_link";
+    cmd_stamped.twist = cmd;
+    cmd_vel_stamped_pub_->publish(cmd_stamped);
+  } else {
+    // Publish Twist
+    cmd_vel_pub_->publish(cmd);
+  }
 }
 
 // ----- PATH PUBLICATION -----

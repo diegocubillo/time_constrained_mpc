@@ -51,6 +51,11 @@ target_link_libraries(time_constrained_mpc
 install(TARGETS time_constrained_mpc
   DESTINATION lib/${PROJECT_NAME})
 
+# Install Python scripts
+install(PROGRAMS
+  scripts/send_example_path.py
+  DESTINATION lib/${PROJECT_NAME})
+
 # Install launch files
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
