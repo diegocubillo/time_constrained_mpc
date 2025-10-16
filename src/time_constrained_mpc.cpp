@@ -34,6 +34,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & state)
   // Parameters
   max_linear_vel_ = this->declare_parameter<double>("max_linear_vel", 0.5);
   max_angular_vel_ = this->declare_parameter<double>("max_angular_vel", 1.0);
+  max_linear_accel_ = this->declare_parameter<double>("max_linear_accel", 0.2);
+  max_angular_accel_ = this->declare_parameter<double>("max_angular_accel", 0.3);
   horizon_sec_ = this->declare_parameter<double>("horizon_sec", 2.0);
   horizon_steps_ = this->declare_parameter<int>("horizon_steps", 10);
   
@@ -519,7 +521,8 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
       du_prev_(0) = work->solution->x[0];
       du_prev_(1) = work->solution->x[1];
       
-      // Saturate controls
+      // Saturate controls as safety measure
+      // (Should not be necessary if constraints are properly set, but kept as failsafe)
       cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
       cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
     } else {
@@ -746,36 +749,52 @@ void MPCController::build_mpc_matrices(
   q = S_u.transpose() * Q_bar * S_x * x_aug;
   
   // Constraints: control limits
-  const int n_constraints = 2 * dim_u * N;  // Upper and lower bounds for v and omega
+  // We use box constraints: l <= Δu <= u
+  // OSQP needs: l <= A*Δu <= u, where A is identity for box constraints
+  const int n_constraints = dim_u * N;  // One constraint per control variable
   A.resize(n_constraints, dim_u * N);
   l.resize(n_constraints);
   u.resize(n_constraints);
   
-  // Build constraint matrix (identity for simple box constraints)
+  // Build constraint matrix (identity for box constraints)
   std::vector<Eigen::Triplet<double>> triplets;
   for (int i = 0; i < dim_u * N; ++i) {
-    // Lower bound constraints
     triplets.push_back(Eigen::Triplet<double>(i, i, 1.0));
-    // Upper bound constraints
-    triplets.push_back(Eigen::Triplet<double>(dim_u * N + i, i, 1.0));
   }
   A.setFromTriplets(triplets.begin(), triplets.end());
   
-  // Set constraint bounds
+  // Calculate current accumulated velocities
+  // v_current = v_ref + du_prev
+  double v_current = u_ref(0) + du_prev_(0);
+  double w_current = u_ref(1) + du_prev_(1);
+  
+  // Set constraint bounds for each step in the horizon
   for (int i = 0; i < N; ++i) {
-    // Linear velocity constraints (du)
-    l(dim_u * i) = -0.2;      // min dv
-    u(dim_u * i) = 0.2;       // max dv
+    // Linear velocity constraints (Δv)
+    // We want: 0 <= v_current + Δv_i <= v_max
+    // Therefore: -v_current <= Δv_i <= v_max - v_current
+    // But also: -max_linear_accel_ <= Δv_i <= max_linear_accel_ (acceleration limits)
+    // Final bounds are the intersection of both constraints
+    double delta_v_min = std::max(-max_linear_accel_, 0.0 - v_current);
+    double delta_v_max = std::min(max_linear_accel_, max_linear_vel_ - v_current);
     
-    // Angular velocity constraints (du)
-    l(dim_u * i + 1) = -0.3;  // min domega
-    u(dim_u * i + 1) = 0.3;   // max domega
+    l(dim_u * i) = delta_v_min;
+    u(dim_u * i) = delta_v_max;
     
-    // Duplicate for upper bound constraints
-    l(dim_u * N + dim_u * i) = -0.2;
-    u(dim_u * N + dim_u * i) = 0.2;
-    l(dim_u * N + dim_u * i + 1) = -0.3;
-    u(dim_u * N + dim_u * i + 1) = 0.3;
+    // Angular velocity constraints (Δω)
+    // We want: -ω_max <= w_current + Δω_i <= ω_max
+    // Therefore: -ω_max - w_current <= Δω_i <= ω_max - w_current
+    // But also: -max_angular_accel_ <= Δω_i <= max_angular_accel_ (angular acceleration limits)
+    double delta_w_min = std::max(-max_angular_accel_, -max_angular_vel_ - w_current);
+    double delta_w_max = std::min(max_angular_accel_, max_angular_vel_ - w_current);
+    
+    l(dim_u * i + 1) = delta_w_min;
+    u(dim_u * i + 1) = delta_w_max;
+    
+    // Note: For simplicity, we assume the same velocity limits apply throughout
+    // the horizon. A more sophisticated approach would accumulate the deltas
+    // to predict v_i = v_current + sum(Δv_j for j=0..i-1)
+    // However, this would make the constraints coupled and non-box constraints.
   }
 }
 
