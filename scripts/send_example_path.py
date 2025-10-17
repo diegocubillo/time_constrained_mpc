@@ -58,7 +58,7 @@ class PathFollowerExample(Node):
             goal_msg, feedback_callback=self.feedback_callback)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
-    def send_line_path(self, length=3.0, num_points=15):
+    def send_line_path(self, length=3.0, num_points=15, ms_increment=100):
         """Send a straight line path to the controller"""
 
         # Wait for action server
@@ -68,12 +68,18 @@ class PathFollowerExample(Node):
         # Create path
         path = Path()
         path.header.frame_id = 'map'
-        path.header.stamp = self.get_clock().now().to_msg()
+        current_time = self.get_clock().now()
+        path.header.stamp = current_time.to_msg()
 
         # Generate straight line path
         for i in range(num_points):
             pose = PoseStamped()
-            pose.header = path.header
+            pose.header.frame_id = 'map'
+            iteration_time = current_time + rclpy.duration.Duration(
+                nanoseconds=ms_increment * 1e6 * i)
+            pose.header.stamp = iteration_time.to_msg()
+
+            # Position along x-axis
             pose.pose.position.x = length * i / (num_points - 1)
             pose.pose.position.y = 0.0
             pose.pose.position.z = 0.0
@@ -90,6 +96,11 @@ class PathFollowerExample(Node):
 
         self.get_logger().info(
             f'Sending line path with {len(path.poses)} poses'
+            )
+
+        velocity = length / ((num_points - 1) * (ms_increment / 1000.0))
+        self.get_logger().info(
+            f'Velocity between points: {velocity:.2f} m/s'
             )
 
         # Send goal
@@ -177,12 +188,12 @@ def main(args=None):
 
     # Choose which path to send:
     # node.send_circular_path(radius=2.0, num_points=20)
-    # node.send_line_path(length=8.0, num_points=16)
-    node.send_sine_path(
-        amplitude=1.0,
-        wavelength=2.0,
-        length=8.0,
-        num_points=40)
+    node.send_line_path(length=8.0, num_points=16, ms_increment=1500)
+    # node.send_sine_path(
+    #     amplitude=1.0,
+    #     wavelength=2.0,
+    #     length=8.0,
+    #     num_points=40)
 
     try:
         rclpy.spin(node)
