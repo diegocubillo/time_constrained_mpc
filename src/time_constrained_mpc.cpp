@@ -691,14 +691,19 @@ void MPCController::build_mpc_matrices(
   B_d(2, 1) = d_t_;
   
   // Augmented system matrices
-  // The augmented state is ξ_k = [x_k; z_k] where z_k = Δu_{k-1}
-  // The dynamics are: x_{k+1} = A_d·x_k + B_d·z_k + B_d·Δu_k
-  //                   z_{k+1} = Δu_k  (simple assignment, NOT z_k + Δu_k)
+  // The augmented state is ξ_k = [x_k; u_{k-1}]
+  // where u_{k-1} is the PREVIOUS VELOCITY (not increment)
+  // 
+  // Dynamics:
+  //   x_{k+1} = A_d·x_k + B_d·u_{k-1} + B_d·Δu_k = A_d·x_k + B_d·u_k  ✓
+  //   u_k = u_{k-1} + Δu_k  ✓
+  //
+  // This ensures the robot dynamics are physically correct:
+  //   x_{k+1} only depends on current velocity u_k, not on u_{k-2}
   Eigen::MatrixXd A_aug = Eigen::MatrixXd::Zero(dim_aug, dim_aug);
   A_aug.topLeftCorner(dim_x, dim_x) = A_d;
   A_aug.topRightCorner(dim_x, dim_u) = B_d;
-  // Note: bottomRightCorner remains 0_{2×2}, NOT I_2
-  // This ensures z_{k+1} = Δu_k (not z_{k+1} = z_k + Δu_k)
+  A_aug.bottomRightCorner(dim_u, dim_u) = Eigen::Matrix2d::Identity();  // Store u_{k-1}
   
   Eigen::MatrixXd B_aug = Eigen::MatrixXd::Zero(dim_aug, dim_u);
   B_aug.topLeftCorner(dim_x, dim_u) = B_d;
@@ -727,26 +732,33 @@ void MPCController::build_mpc_matrices(
   }
   
   // Build cost matrices
+  // Q_bar: Penalizes trajectory tracking error
   Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(dim_x * N, dim_x * N);
   for (int i = 0; i < N; ++i) {
     Q_bar.block(dim_x * i, dim_x * i, dim_x, dim_x) = Q_;
   }
   
-  Eigen::MatrixXd R_bar = Eigen::MatrixXd::Zero(dim_u * N, dim_u * N);
+  // R_d_bar: Penalizes control rate changes (smoothness)
+  // NOTE: We only use R_d (not R) because we don't penalize absolute control effort
+  // This is "Option 2": only smooth movements, no energy optimization
+  Eigen::MatrixXd R_d_bar = Eigen::MatrixXd::Zero(dim_u * N, dim_u * N);
   for (int i = 0; i < N; ++i) {
-    R_bar.block(dim_u * i, dim_u * i, dim_u, dim_u) = R_ + R_d_;
+    R_d_bar.block(dim_u * i, dim_u * i, dim_u, dim_u) = R_d_;
   }
   
   // QP problem: min 0.5 * x^T * P * x + q^T * x
   // subject to: l <= A*x <= u
   
-  // Augmented state vector
+  // Augmented state vector: ξ_0 = [e; u_{-1}]
+  // where e = x_current - x_desired (state error)
+  // and u_{-1} = u_ref + du_prev (previous velocity, not increment)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = e;
-  x_aug.tail(dim_u) = du_prev_;
+  x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity (absolute)
   
   // P matrix (Hessian)
-  Eigen::MatrixXd P_dense = S_u.transpose() * Q_bar * S_u + R_bar;
+  // Cost: ||x_i - x_ref||²_Q + ||Δu_i||²_{R_d}
+  Eigen::MatrixXd P_dense = S_u.transpose() * Q_bar * S_u + R_d_bar;
   P = P_dense.sparseView();
   
   // q vector (gradient)

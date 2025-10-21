@@ -23,12 +23,14 @@ mpc_controller:
     
     # MPC Cost Weights
     # State tracking weights [x, y, theta]
-    Q_matrix_diag: [10.0, 10.0, 1.0]
+    Q_matrix_diag: [50.0, 50.0, 0.1]
     
     # Control effort weights [v, omega]
-    R_matrix_diag: [1.0, 1.0]
+    # NOTE: R_matrix is currently NOT USED (Option 2: only smooth movements)
+    # Only R_d_matrix (rate of change) is penalized for smoothness
+    # R_matrix_diag: [1.0, 1.0]
     
-    # Control rate weights [dv, domega]
+    # Control rate weights (change/acceleration) [dv, domega]
     R_d_matrix_diag: [10.0, 10.0]
     
     # Frame IDs

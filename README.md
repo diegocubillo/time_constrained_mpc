@@ -26,9 +26,21 @@ This package implements an efficient Model Predictive Controller (MPC) for diffe
 x = [x, y, θ]  // Robot position (x, y) and orientation (θ)
 ```
 
+### Augmented State Vector
+The controller uses an augmented state to handle control increments:
+```
+ξ = [x, y, θ, u_prev_v, u_prev_ω]  // State + previous velocities
+```
+This stores the previous velocity (NOT the increment), which ensures correct dynamics: x_{k+1} = A·x_k + B·u_k
+
 ### Control Vector
 ```
 u = [v, ω]  // Linear velocity (v) and angular velocity (ω)
+```
+
+The optimizer works with control increments:
+```
+Δu = [Δv, Δω]  // Changes in velocity and angular rate
 ```
 
 ### Differential Drive Kinematics
@@ -38,21 +50,41 @@ dy/dt = v * sin(θ)
 dθ/dt = ω
 ```
 
+The model is linearized around the reference trajectory and discretized for MPC.
+
 ### Cost Function
-The MPC minimizes the following quadratic cost:
+The MPC minimizes the following quadratic cost (Option 2 - smoothness only):
 ```
-J = Σ(||x_i - x_ref||²_Q + ||Δu_i||²_R + ||Δ²u_i||²_Rd)
+J = Σ(||x_i - x_ref||²_Q + ||Δu_i||²_Rd)
 ```
 
 Where:
-- **Q** = State tracking weight matrix [x, y, θ]
-- **R** = Control effort weight matrix [v, ω]
-- **R_d** = Control rate weight matrix [Δv, Δω]
+- **Q** = State tracking weight matrix [x, y, θ] - penalizes deviation from path
+- **R_d** = Control rate weight matrix [Δv, Δω] - penalizes abrupt changes (smoothness)
+
+**Note**: The current implementation (Option 2) does NOT penalize absolute control effort (no R matrix in cost). This means:
+- ✅ Robot generates smooth movements (no jerky accelerations)
+- ⚠️ Robot may maintain high constant velocities without penalty (no energy optimization)
+- ✅ Simpler formulation and faster computation
 
 ### Constraints
-- Linear velocity: 0 ≤ v ≤ max_linear_vel
-- Angular velocity: -max_angular_vel ≤ ω ≤ max_angular_vel
-- Control rate limits to ensure smooth motions
+The controller implements hybrid constraints combining acceleration limits and absolute velocity bounds:
+
+**Control rate (acceleration) limits:**
+- -max_linear_accel ≤ Δv ≤ max_linear_accel
+- -max_angular_accel ≤ Δω ≤ max_angular_accel
+
+**Absolute velocity limits:**
+- 0 ≤ v ≤ max_linear_vel
+- -max_angular_vel ≤ ω ≤ max_angular_vel
+
+The constraints are dynamically adjusted to ensure both limits are respected:
+```
+Δv_min = max(-max_linear_accel, 0 - v_current)
+Δv_max = min(max_linear_accel, max_linear_vel - v_current)
+```
+
+This ensures the optimizer knows about both acceleration and velocity limits, preventing unexpected saturation.
 
 ## Parameters
 
@@ -64,6 +96,8 @@ Where:
 ### Velocity Limits
 - `max_linear_vel` (default: 0.5): Maximum linear velocity in m/s
 - `max_angular_vel` (default: 1.0): Maximum angular velocity in rad/s
+- `max_linear_accel` (default: 0.2): Maximum linear acceleration in m/s²
+- `max_angular_accel` (default: 0.3): Maximum angular acceleration in rad/s²
 
 ### Lookahead Parameters
 - `lookahead_time` (default: 1.5): Lookahead time multiplier in seconds
@@ -76,8 +110,8 @@ Where:
 
 ### Cost Matrix Weights
 - `Q_matrix_diag` (default: [10.0, 10.0, 1.0]): State error weights [x, y, θ]
-- `R_matrix_diag` (default: [1.0, 1.0]): Control effort weights [v, ω]
-- `R_d_matrix_diag` (default: [10.0, 10.0]): Control rate weights [Δv, Δω]
+- `R_matrix_diag` (default: [1.0, 1.0]): **NOT USED in Option 2** - Control effort weights [v, ω]
+- `R_d_matrix_diag` (default: [10.0, 10.0]): Control rate weights [Δv, Δω] - controls smoothness
 
 ### Frame IDs
 - `map_frame` (default: "map"): Global reference frame
@@ -169,6 +203,13 @@ The implementation is optimized for resource-constrained platforms:
 2. **OSQP Solver**: Fast, warm-starting quadratic programming solver designed for real-time control
 3. **Linearized Dynamics**: Uses linearized differential drive model around reference trajectory for computational efficiency
 4. **Receding Horizon**: Only the first control input is applied, then the optimization is repeated
+5. **Augmented State Formulation**: Efficiently handles control increments without complex constraint matrices
+
+### State Augmentation Details
+The controller uses an augmented state ξ = [x, y, θ, u_prev_v, u_prev_ω] where:
+- The state includes the **previous velocity** (not the increment)
+- Matrix A_aug has I₂ in the bottom-right corner, implementing: u_k = u_{k-1} + Δu_k
+- This ensures correct dynamics: x_{k+1} = A·x_k + B·u_k (no spurious u_{k-2} dependency)
 
 ### Typical Performance on Raspberry Pi 4
 - Solve time: < 10 ms for N=10 horizon
@@ -179,18 +220,24 @@ The implementation is optimized for resource-constrained platforms:
 
 ### For Faster Response
 - Increase Q weights (especially for position tracking)
-- Decrease R weights (less penalty on control effort)
 - Decrease horizon_steps (faster computation)
+- Increase max velocities and accelerations
 
 ### For Smoother Motion
 - Increase R_d weights (more penalty on control changes)
+- Decrease max_linear_accel and max_angular_accel
 - Increase horizon_steps (longer prediction)
-- Decrease max velocities
 
 ### For Better Path Tracking
 - Increase Q_matrix_diag for x and y
 - Increase lookahead distance
 - Increase horizon_sec
+
+### About R_matrix_diag (Not Used)
+The R_matrix_diag parameter exists but is NOT used in the current implementation (Option 2). To add energy optimization:
+- Would require implementing Option 1 with cumulative control matrix
+- Would penalize maintaining high velocities (energy-efficient movements)
+- Current implementation prioritizes simplicity and smoothness over energy optimization
 
 ## Future Enhancements
 
@@ -200,6 +247,8 @@ This is the base MPC controller. Future work will include:
 - 📊 Cost-to-go estimation for better terminal cost
 - 🔄 Adaptive horizon based on path curvature
 - 📈 Performance profiling and optimization
+- ⚡ Option 1 implementation (energy optimization with absolute control penalty)
+- 🎯 Coupled constraints for better horizon-wide velocity limit enforcement
 
 ## References
 

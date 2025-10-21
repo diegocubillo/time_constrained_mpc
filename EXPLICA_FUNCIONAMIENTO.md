@@ -7,13 +7,12 @@
 | $x_i$ | 3×1 | Estado del robot en el paso $i$: $[x, y, \theta]^T$ (posición x, y y orientación) |
 | $u_i$ | 2×1 | Control aplicado en el paso $i$: $[v, \omega]^T$ (velocidad lineal y angular) |
 | $\Delta u_i$ | 2×1 | Incremento de control: $u_i - u_{i-1}$ (cambio respecto al control anterior) |
-| $z_k$ | 2×1 | Variable de memoria del estado aumentado: $z_k = \Delta u_{k-1}$ (almacena el incremento anterior) |
-| $\xi_k$ | 5×1 | Estado aumentado: $\xi_k = [x_k, y_k, \theta_k, z_{k,v}, z_{k,\omega}]^T = [x_k; z_k]$ donde $z_k = \Delta u_{k-1}$ |
+| $\xi_k$ | 5×1 | Estado aumentado: $\xi_k = [x_k, y_k, \theta_k, u_{k-1,v}, u_{k-1,\omega}]^T = [x_k; u_{k-1}]$ donde $u_{k-1}$ es la velocidad **anterior** (NO el incremento) |
 | $N$ | - | Número de pasos del horizonte de predicción (ej: 10) |
 | $\Delta t$ | - | Paso de tiempo del control (ej: 0.1s) |
 | $Q$ | 3×3 | Matriz de peso para el error de estado (penaliza desviaciones de posición/orientación) |
-| $R$ | 2×2 | Matriz de peso para el control (penaliza uso de energía) |
-| $R_d$ | 2×2 | Matriz de peso para cambios de control (penaliza aceleraciones bruscas) |
+| $R$ | 2×2 | **NO USADO en Opción 2** - Matriz de peso para el control (penaliza uso de energía) |
+| $R_d$ | 2×2 | Matriz de peso para cambios de control (penaliza aceleraciones bruscas/suavidad) |
 | $A_d$ | 3×3 | Matriz de transición de estados discretizada |
 | $B_d$ | 3×2 | Matriz de entrada de control discretizada |
 | $A_{aug}$ | 5×5 | Matriz de transición del sistema aumentado |
@@ -24,7 +23,7 @@
 | $P$ | 2N×2N | Matriz Hessiana del problema QP |
 | $q$ | 2N×1 | Vector gradiente del problema QP |
 | $\bar{Q}$ | 3N×3N | Matriz de peso del error de estado extendida para todo el horizonte |
-| $\bar{R}$ | 2N×2N | Matriz de peso del control extendida para todo el horizonte |
+| $\bar{R}_d$ | 2N×2N | Matriz de peso de incrementos de control extendida para todo el horizonte (solo $R_d$, no $R$) |
 | $v_{ref}$ | - | Velocidad lineal de referencia (obtenida de la odometría actual del robot) |
 | $\omega_{ref}$ | - | Velocidad angular de referencia (obtenida de la odometría actual del robot) |
 | $\theta_{ref}$ | - | Orientación de referencia (obtenida del lookahead point en la trayectoria) |
@@ -39,6 +38,11 @@
   - $\Delta u_0 = u_0 - u_{-1}$ (control actual menos control del ciclo anterior)
   - $\Delta u_1 = u_1 - u_0$ (siguiente control menos control actual)
   - En el código, `du_prev_` almacena el incremento aplicado en el ciclo anterior
+
+- **Estado aumentado $\xi_k$**: Almacena $u_{k-1}$ (velocidad anterior), NO $\Delta u_{k-1}$ (incremento):
+  - La memoria guarda la **velocidad absoluta anterior**: $u_{k-1} = [v_{k-1}, \omega_{k-1}]^T$
+  - Esto permite calcular correctamente: $u_k = u_{k-1} + \Delta u_k$
+  - La dinámica queda: $x_{k+1} = A_d \cdot x_k + B_d \cdot u_k$ ✓ (correcta)
 
 - **Aplicación del control**: El control final que se publica es:
   ```
@@ -55,25 +59,36 @@ El MPC (Model Predictive Control) resuelve un problema de optimización en cada 
 La función de costo a minimizar es:
 
 $$
-\min_{u_0, u_1, ..., u_{N-1}} J = \sum_{i=0}^{N-1} \left[ \|x_i - x_{ref}\|_Q^2 + \|u_i - u_{ref}\|_R^2 + \|\Delta u_i\|_{R_d}^2 \right]
+\min_{u_0, u_1, ..., u_{N-1}} J = \sum_{i=0}^{N-1} \left[ \|x_i - x_{ref}\|_Q^2 + \|\Delta u_i\|_{R_d}^2 \right]
 $$
+
+**Nota**: La implementación actual usa **Opción 2** (solo penaliza incrementos), donde:
+- $\|x_i - x_{ref}\|_Q^2$: Penaliza la desviación del estado respecto a la referencia
+- $\|\Delta u_i\|_{R_d}^2$: Penaliza cambios bruscos en el control (suavidad)
+- **NO se penaliza** $\|u_i - u_{ref}\|_R^2$ (esfuerzo de control absoluto)
+
+Esto significa que el robot busca movimientos suaves pero puede mantener velocidades altas constantes sin penalización.
 
 Donde cada término tiene un propósito específico:
 
 - **$\|x_i - x_{ref}\|_Q^2$**: Penaliza la desviación del estado respecto a la referencia (queremos estar cerca del camino deseado)
-- **$\|u_i - u_{ref}\|_R^2$**: Penaliza el uso de control (queremos usar poca energía)
 - **$\|\Delta u_i\|_{R_d}^2$**: Penaliza cambios bruscos en el control (queremos movimientos suaves)
 
 **Interpretación física:**
 - Si $Q$ es grande: el robot se esfuerza más por seguir exactamente la trayectoria
-- Si $R$ es grande: el robot prefiere usar menos potencia aunque se desvíe un poco
 - Si $R_d$ es grande: el robot evita aceleraciones bruscas, moviéndose más suavemente
+
+**Consecuencias de la Opción 2:**
+- ✅ El robot genera movimientos suaves (sin cambios bruscos)
+- ⚠️ El robot **no optimiza energía** - puede mantener velocidades altas constantes sin penalización
+- ✅ Formulación más simple (no requiere matriz de acumulación $T_{cum}$)
+- ✅ Menos costo computacional
 
 ---
 
-## 2. **El Truco del Estado Aumentado**
+## 2. **El Estado Aumentado**
 
-Para manejar el término $\Delta u$ (cambios en el control) sin complicar matemáticamente el problema, se usa un "truco": **aumentar el vector de estado**.
+Para poder formular el MPC en términos de incrementos de control $\Delta u$, utilizamos un **estado aumentado** que incluye memoria de la velocidad anterior.
 
 ### Estado original del robot:
 $$
@@ -82,10 +97,15 @@ $$
 
 ### Estado aumentado:
 $$
-\xi = \begin{bmatrix} x \\ y \\ \theta \\ \Delta u_v \\ \Delta u_\omega \end{bmatrix} \in \mathbb{R}^5
+\xi = \begin{bmatrix} x \\ y \\ \theta \\ u_{v,prev} \\ u_{\omega,prev} \end{bmatrix} = \begin{bmatrix} x \\ u_{-1} \end{bmatrix} \in \mathbb{R}^5
 $$
 
-Ahora el "estado" incluye también el último cambio de control. Esto permite que el optimizador trabaje directamente con incrementos.
+**Crítico**: El estado aumentado almacena $u_{-1}$ (velocidad anterior), **NO** $\Delta u_{-1}$ (incremento anterior).
+
+Esto permite:
+1. Calcular la velocidad actual: $u_k = u_{k-1} + \Delta u_k$
+2. Mantener la dinámica correcta: $x_{k+1} = A_d \cdot x_k + B_d \cdot u_k$
+3. Trabajar con incrementos $\Delta u$ como variables de decisión
 
 ### Modelo del robot sin aumentar:
 
@@ -131,26 +151,15 @@ $$
 
 ### Modelo aumentado:
 
-**Notación clara del estado aumentado:**
-
-Definimos el estado aumentado como:
-$$
-\xi_k = \begin{bmatrix} x_k \\ z_k \end{bmatrix}
-$$
-
-Donde:
-- $x_k \in \mathbb{R}^3$ es el estado físico del robot: $[x, y, \theta]^T$
-- $z_k \in \mathbb{R}^2$ es la **memoria del incremento anterior**: $z_k = \Delta u_{k-1}$
-
 **Ecuación de evolución del estado aumentado:**
 
 $$
-\xi_{k+1} = \begin{bmatrix} x_{k+1} \\ z_{k+1} \end{bmatrix} = 
+\xi_{k+1} = \begin{bmatrix} x_{k+1} \\ u_k \end{bmatrix} = 
 \begin{bmatrix}
 A_d & B_d \\
-0_{2×3} & 0_{2×2}
+0_{2×3} & I_2
 \end{bmatrix}
-\begin{bmatrix} x_k \\ z_k \end{bmatrix} +
+\begin{bmatrix} x_k \\ u_{k-1} \end{bmatrix} +
 \begin{bmatrix}
 B_d \\
 I_2
@@ -158,167 +167,88 @@ I_2
 \Delta u_k
 $$
 
-**⚠️ Nota crítica:** La submatriz inferior derecha es $0_{2×2}$, **NO** $I_2$. Esto significa que $z_k$ NO se propaga al siguiente estado.
+**Nota crítica:** La submatriz inferior derecha es $I_2$ (identidad), **NO** $0_{2×2}$. Esto implementa la actualización de velocidad: $u_k = u_{k-1} + \Delta u_k$.
 
 **Descomponiendo en dos ecuaciones separadas:**
 
 #### **Ecuación 1: Dinámica del robot**
 $$
-x_{k+1} = A_d \cdot x_k + B_d \cdot z_k + B_d \cdot \Delta u_k
+x_{k+1} = A_d \cdot x_k + B_d \cdot u_{k-1} + B_d \cdot \Delta u_k
 $$
 
-Como $z_k = \Delta u_{k-1} = u_{k-1} - u_{k-2}$, esto es equivalente a:
+Simplificando (usando $u_k = u_{k-1} + \Delta u_k$):
 $$
-x_{k+1} = A_d \cdot x_k + B_d \cdot (u_{k-1} - u_{k-2}) + B_d \cdot (u_k - u_{k-1})
-$$
-$$
-x_{k+1} = A_d \cdot x_k + B_d \cdot u_k - B_d \cdot u_{k-2}
+x_{k+1} = A_d \cdot x_k + B_d \cdot u_k \quad \text{✓ Dinámica correcta}
 $$
 
-Esta ecuación describe la cinemática real del robot considerando el control actual y la "inercia" del control de hace 2 pasos.
+Esta es la cinemática correcta del robot: el siguiente estado solo depende del control actual $u_k$, **NO** de $u_{k-2}$.
 
-#### **Ecuación 2: Actualización de memoria (simple asignación)**
+#### **Ecuación 2: Actualización de velocidad**
 $$
-z_{k+1} = 0_{2×3} \cdot x_k + 0_{2×2} \cdot z_k + I_2 \cdot \Delta u_k
+u_k = 0_{2×3} \cdot x_k + I_2 \cdot u_{k-1} + I_2 \cdot \Delta u_k
 $$
 
 Simplificando:
 $$
-z_{k+1} = \Delta u_k
+u_k = u_{k-1} + \Delta u_k \quad \text{✓ Definición de incremento}
 $$
 
-**Verificación en términos de velocidades absolutas:**
-$$
-z_{k+1} = u_k - u_{k-1} \quad \text{✓ Correcto por definición}
-$$
+**Interpretación física:**
 
-**Interpretación rigurosa:**
+La segunda ecuación implementa la definición de incremento de control:
+> "La velocidad actual es la velocidad anterior más el cambio que aplicamos"
 
-La segunda ecuación **NO** es una ecuación dinámica. Es una **asignación directa** que dice:
-
-> "La variable de memoria $z$ en el siguiente paso es simplemente el incremento de control que aplicamos ahora"
-
-**Verificación completa en términos de velocidades absolutas:**
+**Ejemplo numérico:**
 
 ```
 k = 0:
-  u_{-1} = [0, 0]       (velocidad inicial)
-  u_0 = [0.5, 0.1]      (optimizador decide)
-  z_0 = u_{-1} - u_{-2} = [0, 0]
-  Δu_0 = u_0 - u_{-1} = [0.5, 0.1]
+  u_{-1} = [0, 0]          (velocidad inicial: robot en reposo)
+  Δu_0 = [0.1, 0.05]       (optimizador decide primer incremento)
   
-  Actualización: z_1 = Δu_0 = u_0 - u_{-1} = [0.5, 0.1] ✓
+  Actualización: u_0 = u_{-1} + Δu_0 = [0.1, 0.05] ✓
+  Dinámica: x_1 = A_d·x_0 + B_d·u_0 ✓
 
 k = 1:
-  u_0 = [0.5, 0.1]      (control previo)
-  u_1 = [0.6, 0.15]     (optimizador decide)
-  z_1 = u_0 - u_{-1} = [0.5, 0.1]
-  Δu_1 = u_1 - u_0 = [0.1, 0.05]
+  u_0 = [0.1, 0.05]        (velocidad anterior)
+  Δu_1 = [0.08, 0.03]      (optimizador decide)
   
-  Actualización: z_2 = Δu_1 = u_1 - u_0 = [0.1, 0.05] ✓
+  Actualización: u_1 = u_0 + Δu_1 = [0.18, 0.08] ✓
+  Dinámica: x_2 = A_d·x_1 + B_d·u_1 ✓ (solo depende de u_1, NO de u_{-1})
 
 k = 2:
-  u_1 = [0.6, 0.15]     (control previo)
-  u_2 = [0.65, 0.18]    (optimizador decide)
-  z_2 = u_1 - u_0 = [0.1, 0.05]
-  Δu_2 = u_2 - u_1 = [0.05, 0.03]
+  u_1 = [0.18, 0.08]       (velocidad anterior)
+  Δu_2 = [0.05, 0.02]      (optimizador decide)
   
-  Actualización: z_3 = Δu_2 = u_2 - u_1 = [0.05, 0.03] ✓
+  Actualización: u_2 = u_1 + Δu_2 = [0.23, 0.10] ✓
+  Dinámica: x_3 = A_d·x_2 + B_d·u_2 ✓ (solo depende de u_2, NO de u_0)
 ```
 
-**Por qué $z_k$ NO se suma:**
+**Ventajas de este enfoque:**
 
-Si tuviéramos $z_{k+1} = z_k + \Delta u_k$, entonces:
-$$z_{k+1} = (u_{k-1} - u_{k-2}) + (u_k - u_{k-1}) = u_k - u_{k-2}$$
-
-Pero por definición queremos:
-$$z_{k+1} = \Delta u_k = u_k - u_{k-1}$$
-
-**Por lo tanto, la matriz correcta debe tener $0_{2×2}$ en la posición inferior derecha, NO $I_2$.**
-
-**Formulación en términos de velocidades absolutas:**
-
-La dinámica completa del sistema en términos de las velocidades absolutas $u_k$ es:
-
-$$
-\xi_{k+1} = \begin{bmatrix} 
-A_d \cdot x_k + B_d \cdot u_k - B_d \cdot u_{k-2} \\ 
-u_k - u_{k-1}
-\end{bmatrix}
-$$
-
-Esto muestra claramente que:
-1. El estado del robot depende del control actual $u_k$ y el control de hace 2 pasos $u_{k-2}$
-2. La memoria simplemente almacena la diferencia entre controles consecutivos
+1. ✅ **Dinámica correcta**: $x_{k+1}$ solo depende de $u_k$ (no hay dependencia espuria de $u_{k-2}$)
+2. ✅ **Simplicidad**: La matriz $I_2$ implementa automáticamente $u_k = u_{k-1} + \Delta u_k$
+3. ✅ **Modelo lineal**: El estado aumentado evoluciona linealmente con $\Delta u_k$
+4. ✅ **Penalización directa**: Podemos penalizar $\Delta u$ directamente en la función de costo
 
 **Analogía en código:**
 
 ```python
 # Estado aumentado en k
 x_k = [x, y, theta]
-z_k = u_k_minus_1 - u_k_minus_2  # Memoria = Δu_{k-1}
+u_k_minus_1 = [v_{k-1}, ω_{k-1}]  # Velocidad anterior (NO incremento)
 
 # Optimizador decide el incremento
 delta_u_k = optimizador.solve()
 
-# Calculamos velocidad absoluta nueva
+# Actualización de velocidad (implementada por I_2 en A_aug)
 u_k = u_k_minus_1 + delta_u_k
 
-# Dinámica del robot (usa u_k y u_k_minus_2)
-x_k_plus_1 = A_d @ x_k + B_d @ u_k - B_d @ u_k_minus_2
-
-# Actualización de memoria (simple asignación)
-z_k_plus_1 = u_k - u_k_minus_1  # = delta_u_k
+# Dinámica del robot (correcta)
+x_k_plus_1 = A_d @ x_k + B_d @ u_k  # ✓ Solo depende de u_k
 
 # Estado aumentado en k+1
-xi_k_plus_1 = [x_k_plus_1, z_k_plus_1]
-
-# Guardar para próxima iteración
-u_k_minus_2 = u_k_minus_1
-u_k_minus_1 = u_k
+xi_k_plus_1 = [x_k_plus_1, u_k]
 ```
-
-**Ventaja del estado aumentado:**
-
-Al mantener $\Delta u_{k-1}$ como parte del estado $\xi_k$, podemos:
-1. Expresar la predicción futura únicamente en términos de $\Delta u_0, \Delta u_1, ..., \Delta u_{N-1}$
-2. Penalizar cambios bruscos de control sin necesitar almacenar histórico externo
-3. Mantener un modelo lineal (estado aumentado evoluciona linealmente con $\Delta u_k$)
-
-### Ejemplo Numérico Completo (con velocidades absolutas)
-
-```
-Instante k=0:
-  u_{-1} = [0, 0]       (robot en reposo)
-  u_0 = ?               (por determinar)
-  x₀ = [0, 0, 0]ᵀ
-  z₀ = Δu_{-1} = [0, 0]ᵀ
-  
-  Optimizador decide: Δu₀ = [0.1, 0.05]ᵀ
-  Velocidad aplicada: u₀ = u_{-1} + Δu₀ = [0.1, 0.05]ᵀ
-  
-Instante k=1:
-  u_0 = [0.1, 0.05]ᵀ    (velocidad anterior)
-  u_1 = ?               (por determinar)
-  
-  Robot se movió: x₁ = A_d·x₀ + B_d·u₀ = [0.01, 0.0, 0.005]ᵀ
-  Memoria: z₁ = Δu₀ = u₀ - u_{-1} = [0.1, 0.05]ᵀ
-  Estado aumentado: ξ₁ = [0.01, 0.0, 0.005, 0.1, 0.05]ᵀ
-  
-  Optimizador decide: Δu₁ = [0.08, 0.03]ᵀ
-  Velocidad aplicada: u₁ = u₀ + Δu₁ = [0.18, 0.08]ᵀ
-  
-Instante k=2:
-  u_1 = [0.18, 0.08]ᵀ   (velocidad anterior)
-  
-  Robot se movió: x₂ = A_d·x₁ + B_d·u₁ - B_d·u_{-1} = [0.03, 0.001, 0.013]ᵀ
-  Memoria: z₂ = Δu₁ = u₁ - u₀ = [0.08, 0.03]ᵀ
-  Estado aumentado: ξ₂ = [0.03, 0.001, 0.013, 0.08, 0.03]ᵀ
-```
-
-**Observación clave:** La variable $z_k$ simplemente almacena $\Delta u_{k-1} = u_{k-1} - u_{k-2}$. La actualización es una asignación directa, **NO** una suma:
-
-$$z_{k+1} = \Delta u_k \quad \text{(NO es } z_{k+1} = z_k + \Delta u_k \text{)}$$
 
 ---
 
@@ -414,15 +344,15 @@ Ahora queremos convertir nuestra función de costo original en la forma estánda
 Sustituyendo $X = S_x \xi_0 + S_u \Delta U$ en la función de costo:
 
 $$
-J = \sum_{i=0}^{N-1} \left[ \|x_i - x_{ref}\|_Q^2 + \|\Delta u_i\|_{R+R_d}^2 \right]
+J = \sum_{i=0}^{N-1} \left[ \|x_i - x_{ref}\|_Q^2 + \|\Delta u_i\|_{R_d}^2 \right]
 $$
 
-(Nota: asumimos $u_{ref} = 0$ en el espacio de incrementos)
+**Nota Opción 2**: Solo usamos $R_d$ (no $R + R_d$) porque solo penalizamos suavidad, no energía.
 
 Esto se puede escribir en forma matricial:
 
 $$
-J = \|X\|_{\bar{Q}}^2 + \|\Delta U\|_{\bar{R}}^2
+J = \|X\|_{\bar{Q}}^2 + \|\Delta U\|_{\bar{R}_d}^2
 $$
 
 Donde las matrices de peso extendidas son:
@@ -437,15 +367,15 @@ Q & & & \\
 $$
 
 $$
-\bar{R} = \begin{bmatrix}
-R+R_d & & & \\
-& R+R_d & & \\
+\bar{R}_d = \begin{bmatrix}
+R_d & & & \\
+& R_d & & \\
 & & \ddots & \\
-& & & R+R_d
+& & & R_d
 \end{bmatrix} \in \mathbb{R}^{2N×2N}
 $$
 
-**Ejemplo con N=2, Q=diag(10,10,1), R=diag(1,1), R_d=diag(10,10):**
+**Ejemplo con N=2, Q=diag(10,10,1), R_d=diag(10,10):**
 
 $$
 \bar{Q} = \begin{bmatrix}
@@ -456,30 +386,34 @@ $$
 0 & 0 & 0 & 0 & 10 & 0 \\
 0 & 0 & 0 & 0 & 0 & 1
 \end{bmatrix}, \quad
-\bar{R} = \begin{bmatrix}
-11 & 0 & 0 & 0 \\
-0 & 11 & 0 & 0 \\
-0 & 0 & 11 & 0 \\
-0 & 0 & 0 & 11
+\bar{R}_d = \begin{bmatrix}
+10 & 0 & 0 & 0 \\
+0 & 10 & 0 & 0 \\
+0 & 0 & 10 & 0 \\
+0 & 0 & 0 & 10
 \end{bmatrix}
 $$
+
+**Comparación con Opción 1 (no implementada):**
+- **Opción 1**: $\bar{R} = diag(R + R_d, ..., R + R_d)$ - penaliza tanto energía como suavidad
+- **Opción 2 (implementada)**: $\bar{R}_d = diag(R_d, ..., R_d)$ - solo penaliza suavidad
 
 ### Paso 2: Expandir la función de costo
 
 $$
-J = (S_x \xi_0 + S_u \Delta U)^T \bar{Q} (S_x \xi_0 + S_u \Delta U) + \Delta U^T \bar{R} \Delta U
+J = (S_x \xi_0 + S_u \Delta U)^T \bar{Q} (S_x \xi_0 + S_u \Delta U) + \Delta U^T \bar{R}_d \Delta U
 $$
 
 Expandiendo los productos:
 
 $$
-J = \xi_0^T S_x^T \bar{Q} S_x \xi_0 + 2 \xi_0^T S_x^T \bar{Q} S_u \Delta U + \Delta U^T S_u^T \bar{Q} S_u \Delta U + \Delta U^T \bar{R} \Delta U
+J = \xi_0^T S_x^T \bar{Q} S_x \xi_0 + 2 \xi_0^T S_x^T \bar{Q} S_u \Delta U + \Delta U^T S_u^T \bar{Q} S_u \Delta U + \Delta U^T \bar{R}_d \Delta U
 $$
 
 Agrupando términos cuadráticos y lineales en $\Delta U$:
 
 $$
-J = \frac{1}{2} \Delta U^T \underbrace{2(S_u^T \bar{Q} S_u + \bar{R})}_{P} \Delta U + \underbrace{2(S_u^T \bar{Q} S_x \xi_0)^T}_{q^T} \Delta U + \underbrace{\xi_0^T S_x^T \bar{Q} S_x \xi_0}_{\text{constante}}
+J = \frac{1}{2} \Delta U^T \underbrace{2(S_u^T \bar{Q} S_u + \bar{R}_d)}_{P} \Delta U + \underbrace{2(S_u^T \bar{Q} S_x \xi_0)^T}_{q^T} \Delta U + \underbrace{\xi_0^T S_x^T \bar{Q} S_x \xi_0}_{\text{constante}}
 $$
 
 Simplificando (el factor 2 se cancela con el 1/2):
@@ -519,8 +453,8 @@ Con `horizon_steps_ = 10` (N=10):
 | $S_x$ | 30×5 | Matriz de predicción | Proyecta el estado inicial a 10 estados futuros (3 vars × 10 pasos) |
 | $S_u$ | 30×20 | Matriz de predicción | Mapea 20 controles a 30 estados futuros |
 | $\bar{Q}$ | 30×30 | Diagonal por bloques | Peso del error de estado para 10 pasos |
-| $\bar{R}$ | 20×20 | Diagonal por bloques | Peso del control para 10 pasos |
-| $A_{constraint}$ | 40×20 | Matriz de restricciones | Dos restricciones (min/max) por cada una de las 20 variables |
+| $\bar{R}_d$ | 20×20 | Diagonal por bloques | Peso de incrementos de control para 10 pasos (solo $R_d$) |
+| $A_{constraint}$ | 20×20 | Matriz identidad | Restricciones de caja (box constraints) sobre $\Delta U$ |
 | $l, u$ | 40×1 | Límites | Cotas inferiores y superiores |
 
 **Ejemplo numérico del vector de decisión:**
@@ -586,188 +520,100 @@ Porque:
 2. **Realismo**: Los motores reales tienen aceleraciones limitadas
 3. **Seguridad**: Evita comandos que puedan desestabilizar el robot
 
-**Nota sobre las restricciones duplicadas en el código:**
-
-El código actual tiene un bug donde duplica las restricciones:
-```cpp
-// Duplicate for upper bound constraints
-l(dim_u * N + dim_u * i) = -0.2;  // ← Esto es redundante
-u(dim_u * N + dim_u * i) = 0.2;
-```
-
-Esto debería corregirse porque OSQP solo necesita un conjunto de restricciones por variable cuando se usan cotas inferiores (`l`) y superiores (`u`) separadas.
+**Nota importante**: El código también limita las velocidades absolutas ajustando dinámicamente los límites de $\Delta u$ para asegurar que $u_k = u_{k-1} + \Delta u_k$ no exceda los límites de velocidad máxima.
 
 ---
 
-## Punto Crítico: Limitación de Velocidad Absoluta
+## Restricciones de Velocidad Absoluta
 
-### Problema Actual
+### Implementación Actual
 
-El código actual tiene una **limitación importante**: solo restringe los **incrementos** $\Delta u$, pero **NO restringe las velocidades absolutas** dentro del optimizador.
+El código implementa **restricciones dinámicas** que consideran tanto límites de incrementos como límites de velocidad absoluta.
 
-**Lo que hace actualmente:**
+**Lo que hace:**
 
-1. El solver OSQP encuentra $\Delta u_0^*$ óptimo (solo considerando límites de incrementos)
-2. Se calcula: `u_v = Δu_0* + du_prev + v_ref`
-3. **Después** se satura: `cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_)`
-
-```cpp
-// En solve_mpc():
-double u_v = work->solution->x[0] + du_prev_(0) + u_ref(0);
-double u_w = work->solution->x[1] + du_prev_(1) + u_ref(1);
-
-// Saturate controls
-cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);        // ← SATURACIÓN POST-HOC
-cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
-```
-
-### ¿Cuál es el problema?
-
-**El optimizador no sabe que hay un límite de velocidad máxima.** 
-
-Imagina esta situación:
-- `v_ref = 0.4 m/s` (velocidad actual)
-- `du_prev = 0.0`
-- `max_linear_vel_ = 0.5 m/s`
-- El solver encuentra: `Δu_0* = 0.15 m/s` (dentro del límite de incremento ±0.2)
-- Velocidad calculada: `u_v = 0.15 + 0.0 + 0.4 = 0.55 m/s`
-- **Saturación**: `cmd.linear.x = 0.5 m/s`
-
-**Consecuencias:**
-
-1. **El control aplicado NO es el óptimo**: El solver pensaba que iba a aplicar 0.55 m/s, pero realmente se aplica 0.5 m/s
-2. **Predicción incorrecta**: En el siguiente ciclo, el modelo interno del MPC estará desincronizado con la realidad
-3. **Suboptimalidad**: La trayectoria predicha no es la que realmente va a seguir el robot
-
-### Solución Correcta: Restricciones de Velocidad Absoluta
-
-Para resolver esto, **las restricciones de velocidad máxima deben estar DENTRO del problema de optimización**.
-
-#### Formulación matemática:
-
-Añadir restricciones:
-
-$$
-0 \leq u_{ref}(v) + \Delta u_{prev}(v) + \Delta u_i(v) \leq v_{max} \quad \forall i \in [0, N-1]
-$$
-
-$$
--\omega_{max} \leq u_{ref}(\omega) + \Delta u_{prev}(\omega) + \Delta u_i(\omega) \leq \omega_{max} \quad \forall i \in [0, N-1]
-$$
-
-#### En forma matricial:
-
-Para cada paso $i$, añadir dos restricciones (una para $v$, otra para $\omega$):
-
-$$
-\begin{bmatrix}
-1 & 0 & 0 & 0 & \cdots & 0 & 0 \\
-0 & 1 & 0 & 0 & \cdots & 0 & 0
-\end{bmatrix}
-\begin{bmatrix}
-\Delta v_0 \\ \Delta \omega_0 \\ \Delta v_1 \\ \Delta \omega_1 \\ \vdots \\ \Delta v_9 \\ \Delta \omega_9
-\end{bmatrix}
-\leq
-\begin{bmatrix}
-v_{max} - v_{ref} - \Delta u_{prev}(v) \\
-\omega_{max} - \omega_{ref} - \Delta u_{prev}(\omega)
-\end{bmatrix}
-$$
-
-Y restricciones de cota inferior:
-
-$$
-\begin{bmatrix}
-1 & 0 & 0 & 0 & \cdots & 0 & 0 \\
-0 & 1 & 0 & 0 & \cdots & 0 & 0
-\end{bmatrix}
-\begin{bmatrix}
-\Delta v_0 \\ \Delta \omega_0 \\ \Delta v_1 \\ \Delta \omega_1 \\ \vdots \\ \Delta v_9 \\ \Delta \omega_9
-\end{bmatrix}
-\geq
-\begin{bmatrix}
-0 - v_{ref} - \Delta u_{prev}(v) \\
--\omega_{max} - \omega_{ref} - \Delta u_{prev}(\omega)
-\end{bmatrix}
-$$
-
-#### Implementación en código:
+1. Calcula la velocidad acumulada actual: `v_current = v_ref + du_prev(0)`
+2. Ajusta dinámicamente los límites de $\Delta u$ para respetar límites absolutos:
+   - $\Delta v_{min} = \max(-max\_accel, 0 - v_{current})$
+   - $\Delta v_{max} = \min(+max\_accel, v_{max} - v_{current})$
+3. El solver OSQP encuentra $\Delta u_0^*$ óptimo respetando **ambos** límites
+4. Se calcula: `u_v = Δu_0* + du_prev + v_ref`
+5. Se aplica saturación como medida de seguridad adicional (no debería ser necesaria)
 
 ```cpp
-void MPCController::build_mpc_matrices(
-    const Eigen::Vector3d &current_state,
-    const Eigen::Vector3d &desired_state,
-    const Eigen::Vector2d &u_ref,  // Velocidades actuales [v_ref, ω_ref]
-    Eigen::SparseMatrix<double> &P,
-    Eigen::VectorXd &q,
-    Eigen::SparseMatrix<double> &A,
-    Eigen::VectorXd &l,
-    Eigen::VectorXd &u)
-{
-  // ... código existente para construir P y q ...
-  
-  // RESTRICCIONES MEJORADAS:
-  // 1. Límites en incrementos: -0.2 ≤ Δv ≤ 0.2, -0.3 ≤ Δω ≤ 0.3
-  // 2. Límites en velocidades absolutas: 0 ≤ v ≤ v_max, -ω_max ≤ ω ≤ ω_max
-  
-  const int n_constraints = 2 * dim_u * N;  // Dos restricciones por cada control
-  A.resize(n_constraints, dim_u * N);
-  l.resize(n_constraints);
-  u.resize(n_constraints);
-  
-  std::vector<Eigen::Triplet<double>> triplets;
-  
-  for (int i = 0; i < N; ++i) {
-    // Restricción para Δv_i
-    triplets.push_back(Eigen::Triplet<double>(2*i, 2*i, 1.0));
+// En build_mpc_matrices():
+double v_current = u_ref(0) + du_prev_(0);
+double w_current = u_ref(1) + du_prev_(1);
+
+for (int i = 0; i < N; ++i) {
+    // Límites para Δv considerando ambas restricciones
+    double delta_v_min = std::max(-max_linear_accel_, 0.0 - v_current);
+    double delta_v_max = std::min(max_linear_accel_, max_linear_vel_ - v_current);
     
-    // Restricción para Δω_i
-    triplets.push_back(Eigen::Triplet<double>(2*i + 1, 2*i + 1, 1.0));
-  }
-  
-  A.setFromTriplets(triplets.begin(), triplets.end());
-  
-  // Velocidad acumulada actual (incluyendo incremento previo)
-  double v_current = u_ref(0) + du_prev_(0);
-  double w_current = u_ref(1) + du_prev_(1);
-  
-  for (int i = 0; i < N; ++i) {
-    // Límites para Δv_i:
-    // Inferior: max(-0.2, 0 - v_current)         ← No puede bajar más de 0.2 ni hacer v negativa
-    // Superior: min(0.2, v_max - v_current)       ← No puede subir más de 0.2 ni exceder v_max
-    l(2*i) = std::max(-0.2, 0.0 - v_current);
-    u(2*i) = std::min(0.2, max_linear_vel_ - v_current);
+    l(dim_u * i) = delta_v_min;
+    u(dim_u * i) = delta_v_max;
     
-    // Límites para Δω_i:
-    // Inferior: max(-0.3, -ω_max - w_current)
-    // Superior: min(0.3, ω_max - w_current)
-    l(2*i + 1) = std::max(-0.3, -max_angular_vel_ - w_current);
-    u(2*i + 1) = std::min(0.3, max_angular_vel_ - w_current);
-    
-    // Actualizar velocidad acumulada para el siguiente paso
-    // (aproximación: asumimos que se aplicará el incremento máximo permitido)
-    // Esto es una simplificación; idealmente deberíamos usar la solución previa
-    v_current += 0.0;  // En la primera iteración no sabemos qué Δu se aplicará
-    w_current += 0.0;
-  }
+    // Similar para Δω...
 }
 ```
 
-### Comparación de Enfoques
+### Ventajas de este enfoque:
 
-| Aspecto | Enfoque Actual (Saturación Post-hoc) | Enfoque Correcto (Restricciones en QP) |
-|---------|--------------------------------------|----------------------------------------|
-| **Optimalidad** | ❌ No óptimo si hay saturación | ✅ Óptimo considerando todos los límites |
-| **Predicción** | ❌ Puede desincronizarse | ✅ Coherente con el modelo |
-| **Suavidad** | ⚠️ Puede causar discontinuidades | ✅ Suave por diseño |
-| **Simplicidad** | ✅ Más simple de implementar | ⚠️ Más complejo |
-| **Garantías** | ❌ No garantiza que el solver "sepa" de los límites | ✅ Garantías matemáticas |
+1. ✅ **El optimizador conoce los límites**: Las restricciones están en el problema QP
+2. ✅ **Predicción correcta**: El MPC sabe qué velocidades reales se aplicarán
+3. ✅ **Optimalidad**: La solución es óptima considerando **todos** los límites
+4. ✅ **No hay sorpresas**: No hay saturaciones inesperadas post-optimización
 
-### Recomendación
+### Formulación matemática:
 
-**Para un MPC robusto, deberías implementar las restricciones de velocidad absoluta dentro del problema QP.** 
+Las restricciones implementadas son:
 
-Sin embargo, si la velocidad raramente se acerca a `v_max` en tu aplicación, la saturación post-hoc puede ser suficiente como solución temporal.
+$$
+0 \leq v_{current} + \Delta v_i \leq v_{max} \quad \forall i \in [0, N-1]
+$$
+
+$$
+-\omega_{max} \leq \omega_{current} + \Delta \omega_i \leq \omega_{max} \quad \forall i \in [0, N-1]
+$$
+
+Y además:
+
+$$
+-a_{v,max} \leq \Delta v_i \leq a_{v,max}
+$$
+
+$$
+-a_{\omega,max} \leq \Delta \omega_i \leq a_{\omega,max}
+$$
+
+El límite efectivo es la **intersección** de ambas restricciones, implementado con `std::max` y `std::min`.
+
+#### Código en build_mpc_matrices():
+
+```cpp
+// Código real en time_constrained_mpc.cpp (ya implementado):
+double v_current = u_ref(0) + du_prev_(0);
+double w_current = u_ref(1) + du_prev_(1);
+
+for (int i = 0; i < N; ++i) {
+    // Linear velocity constraints (Δv)
+    // Intersección de: [-a_max, +a_max] y [0-v_current, v_max-v_current]
+    double delta_v_min = std::max(-max_linear_accel_, 0.0 - v_current);
+    double delta_v_max = std::min(max_linear_accel_, max_linear_vel_ - v_current);
+    
+    l(dim_u * i) = delta_v_min;
+    u(dim_u * i) = delta_v_max;
+    
+    // Angular velocity constraints (Δω)
+    double delta_w_min = std::max(-max_angular_accel_, -max_angular_vel_ - w_current);
+    double delta_w_max = std::min(max_angular_accel_, max_angular_vel_ - w_current);
+    
+    l(dim_u * i + 1) = delta_w_min;
+    u(dim_u * i + 1) = delta_w_max;
+}
+```
+
+**Nota sobre simplificación**: El código actual aplica los mismos límites a todos los pasos del horizonte, asumiendo que `v_current` no cambia. Una implementación más sofisticada acumularía los incrementos: $v_i = v_{current} + \sum_{j=0}^{i-1} \Delta v_j$, pero esto requeriría restricciones acopladas (no "box constraints").
 
 ---
 
