@@ -229,7 +229,19 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   current_goal_handle_ = goal_handle;
   du_prev_ = Eigen::Vector2d::Zero();
   
+  // Record when path execution starts
+  path_start_time_ = this->now();
+  
   RCLCPP_INFO(get_logger(), "Received new path with %zu poses", global_plan_.poses.size());
+  
+  // Validate that all timestamps are in the future
+  if (!global_plan_.poses.empty()) {
+    auto first_time = rclcpp::Time(global_plan_.poses.front().header.stamp);
+    auto last_time = rclcpp::Time(global_plan_.poses.back().header.stamp);
+    RCLCPP_INFO(get_logger(), "Path temporal span: %.2f to %.2f seconds from now",
+                (first_time - path_start_time_).seconds(),
+                (last_time - path_start_time_).seconds());
+  }
   
   // Execute in a separate thread
   std::thread{[this, goal_handle]() {
@@ -279,11 +291,16 @@ void MPCController::control_loop()
   auto pose = get_robot_pose();
   auto velocity = get_robot_velocity();
 
-  // Calculate lookahead point
-  auto lookahead = calculate_lookahead_point();
-
-  // Solve MPC
-  auto cmd = solve_mpc(pose, velocity, global_plan_);
+  // Calculate temporal error for monitoring
+  double temporal_error = calculate_temporal_error();
+  last_temporal_error_ = temporal_error;
+  
+  // Get reference trajectory for the MPC horizon based on current time
+  rclcpp::Time current_time = this->now();
+  auto reference_trajectory = get_reference_trajectory_horizon(current_time, horizon_steps_, d_t_);
+  
+  // Solve MPC with temporal references
+  auto cmd = solve_mpc(pose, velocity, reference_trajectory);
 
   // Publish command
   publish_velocity_command(cmd);
@@ -399,23 +416,142 @@ geometry_msgs::msg::PoseStamped MPCController::calculate_lookahead_point()
   return lookahead;
 }
 
+// ----- TEMPORAL REFERENCE CALCULATION -----
+geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclcpp::Time &target_time)
+{
+  geometry_msgs::msg::PoseStamped reference;
+  
+  if (global_plan_.poses.empty()) {
+    return reference;
+  }
+  
+  // If target time is before the first pose, return first pose
+  rclcpp::Time first_time(global_plan_.poses.front().header.stamp);
+  if (target_time <= first_time) {
+    reference = global_plan_.poses.front();
+    reference.header.stamp = target_time;
+    return reference;
+  }
+  
+  // If target time is after the last pose, return last pose
+  rclcpp::Time last_time(global_plan_.poses.back().header.stamp);
+  if (target_time >= last_time) {
+    reference = global_plan_.poses.back();
+    reference.header.stamp = target_time;
+    return reference;
+  }
+  
+  // Find the two poses that bracket the target time
+  for (size_t i = 0; i < global_plan_.poses.size() - 1; ++i) {
+    rclcpp::Time t0(global_plan_.poses[i].header.stamp);
+    rclcpp::Time t1(global_plan_.poses[i + 1].header.stamp);
+    
+    if (target_time >= t0 && target_time <= t1) {
+      // Interpolate between poses i and i+1
+      double dt_total = (t1 - t0).seconds();
+      double dt_elapsed = (target_time - t0).seconds();
+      
+      if (dt_total < 1e-6) {
+        // Timestamps are too close, just return first pose
+        reference = global_plan_.poses[i];
+        reference.header.stamp = target_time;
+        return reference;
+      }
+      
+      double ratio = dt_elapsed / dt_total;
+      
+      // Linear interpolation of position
+      reference.pose.position.x = global_plan_.poses[i].pose.position.x + 
+        ratio * (global_plan_.poses[i + 1].pose.position.x - global_plan_.poses[i].pose.position.x);
+      reference.pose.position.y = global_plan_.poses[i].pose.position.y + 
+        ratio * (global_plan_.poses[i + 1].pose.position.y - global_plan_.poses[i].pose.position.y);
+      reference.pose.position.z = global_plan_.poses[i].pose.position.z + 
+        ratio * (global_plan_.poses[i + 1].pose.position.z - global_plan_.poses[i].pose.position.z);
+      
+      // SLERP interpolation of orientation (simplified: just use the target orientation)
+      // For better results, implement proper quaternion SLERP
+      reference.pose.orientation = global_plan_.poses[i + 1].pose.orientation;
+      
+      reference.header.stamp = target_time;
+      reference.header.frame_id = global_plan_.header.frame_id;
+      
+      return reference;
+    }
+  }
+  
+  // Fallback: return last pose
+  reference = global_plan_.poses.back();
+  reference.header.stamp = target_time;
+  return reference;
+}
+
+std::vector<Eigen::Vector3d> MPCController::get_reference_trajectory_horizon(
+    const rclcpp::Time &current_time, int N, double dt)
+{
+  std::vector<Eigen::Vector3d> references;
+  references.reserve(N);
+  
+  for (int i = 0; i < N; ++i) {
+    // Calculate target time for this step in the horizon
+    rclcpp::Time target_time = current_time + rclcpp::Duration::from_seconds(i * dt);
+    
+    // Get the pose at that time
+    auto pose = get_temporal_reference(target_time);
+    
+    // Convert to Eigen vector
+    Eigen::Vector3d ref;
+    ref(0) = pose.pose.position.x;
+    ref(1) = pose.pose.position.y;
+    ref(2) = tf2::getYaw(pose.pose.orientation);
+    
+    references.push_back(ref);
+  }
+  
+  return references;
+}
+
+double MPCController::calculate_temporal_error()
+{
+  if (global_plan_.poses.empty()) {
+    return 0.0;
+  }
+  
+  auto current_pose = get_robot_pose();
+  rclcpp::Time current_time = this->now();
+  
+  // Find the closest pose in the path spatially
+  double min_dist = std::numeric_limits<double>::max();
+  size_t closest_idx = 0;
+  
+  for (size_t i = 0; i < global_plan_.poses.size(); ++i) {
+    double dx = global_plan_.poses[i].pose.position.x - current_pose.pose.position.x;
+    double dy = global_plan_.poses[i].pose.position.y - current_pose.pose.position.y;
+    double dist = std::hypot(dx, dy);
+    
+    if (dist < min_dist) {
+      min_dist = dist;
+      closest_idx = i;
+    }
+  }
+  
+  // Get the timestamp of that pose
+  rclcpp::Time trajectory_time(global_plan_.poses[closest_idx].header.stamp);
+  
+  // Calculate temporal error: positive = ahead of schedule, negative = behind
+  double temporal_error = (trajectory_time - current_time).seconds();
+  
+  return temporal_error;
+}
+
 // ----- MPC SOLVER -----
 geometry_msgs::msg::Twist MPCController::solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const nav_msgs::msg::Path &path)
+    const std::vector<Eigen::Vector3d> &reference_trajectory)
 {
   geometry_msgs::msg::Twist cmd;
   
-  if (path.poses.empty()) {
-    cmd.linear.x = 0.0;
-    cmd.angular.z = 0.0;
-    return cmd;
-  }
-  
-  // Get lookahead point as desired state
-  auto lookahead = calculate_lookahead_point();
-  if (lookahead.header.frame_id.empty()) {
+  if (reference_trajectory.empty()) {
     cmd.linear.x = 0.0;
     cmd.angular.z = 0.0;
     return cmd;
@@ -427,12 +563,6 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
   double current_theta = tf2::getYaw(pose.pose.orientation);
   Eigen::Vector3d current_state(current_x, current_y, current_theta);
   
-  // Extract desired state [x, y, theta]
-  double desired_x = lookahead.pose.position.x;
-  double desired_y = lookahead.pose.position.y;
-  double desired_theta = tf2::getYaw(lookahead.pose.orientation);
-  Eigen::Vector3d desired_state(desired_x, desired_y, desired_theta);
-  
   // Reference control (based on current velocity)
   double vt = vel.linear.x;
   double wt = vel.angular.z;
@@ -442,7 +572,7 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
   Eigen::SparseMatrix<double> P, A;
   Eigen::VectorXd q, l, u;
   
-  build_mpc_matrices(current_state, desired_state, u_ref, P, q, A, l, u);
+  build_mpc_matrices(current_state, reference_trajectory, u_ref, P, q, A, l, u);
   
   // Solve using OSQP
   OSQPWorkspace* work = nullptr;
@@ -588,6 +718,17 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
     global_plan_.poses.back().pose.position.y - pose.pose.position.y);
   
   current_goal_handle_->publish_feedback(feedback);
+  
+  // Log temporal tracking information
+  if (std::abs(last_temporal_error_) > 0.5) {
+    if (last_temporal_error_ > 0) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Temporal tracking: %.2f s ahead of schedule", last_temporal_error_);
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Temporal tracking: %.2f s behind schedule", std::abs(last_temporal_error_));
+    }
+  }
 }
 
 // ----- GOAL CHECK & RESET -----
@@ -656,7 +797,7 @@ Eigen::Vector2d MPCController::differential_drive_model(
 
 void MPCController::build_mpc_matrices(
     const Eigen::Vector3d &current_state,
-    const Eigen::Vector3d &desired_state,
+    const std::vector<Eigen::Vector3d> &reference_trajectory,
     const Eigen::Vector2d &u_ref,
     Eigen::SparseMatrix<double> &P,
     Eigen::VectorXd &q,
@@ -673,21 +814,20 @@ void MPCController::build_mpc_matrices(
   const int dim_u = nu;
   const int dim_aug = dim_x + dim_u;  // 5
   
-  // State error
-  Eigen::Vector3d e = current_state - desired_state;
-  // Normalize angle error
-  e(2) = std::atan2(std::sin(e(2)), std::cos(e(2)));
-  
   // Linearized dynamics around reference trajectory
+  // Use the first reference for linearization
+  Eigen::Vector3d ref_state = reference_trajectory.empty() ? 
+    Eigen::Vector3d::Zero() : reference_trajectory[0];
+  
   // State matrix A (3x3)
   Eigen::Matrix3d A_d = Eigen::Matrix3d::Identity();
-  A_d(0, 2) = -u_ref(0) * std::sin(desired_state(2)) * d_t_;
-  A_d(1, 2) = u_ref(0) * std::cos(desired_state(2)) * d_t_;
+  A_d(0, 2) = -u_ref(0) * std::sin(ref_state(2)) * d_t_;
+  A_d(1, 2) = u_ref(0) * std::cos(ref_state(2)) * d_t_;
   
   // Control matrix B (3x2)
   Eigen::MatrixXd B_d = Eigen::MatrixXd::Zero(dim_x, dim_u);
-  B_d(0, 0) = std::cos(desired_state(2)) * d_t_;
-  B_d(1, 0) = std::sin(desired_state(2)) * d_t_;
+  B_d(0, 0) = std::cos(ref_state(2)) * d_t_;
+  B_d(1, 0) = std::sin(ref_state(2)) * d_t_;
   B_d(2, 1) = d_t_;
   
   // Augmented system matrices
@@ -749,7 +889,17 @@ void MPCController::build_mpc_matrices(
   // QP problem: min 0.5 * x^T * P * x + q^T * x
   // subject to: l <= A*x <= u
   
-  // Augmented state vector: ξ_0 = [e; u_{-1}]
+  // Build reference vector for the entire horizon
+  Eigen::VectorXd x_ref_vec(dim_x * N);
+  for (int i = 0; i < N && i < static_cast<int>(reference_trajectory.size()); ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory[i];
+  }
+  // If reference_trajectory is shorter than N, repeat the last reference
+  for (int i = reference_trajectory.size(); i < N; ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory.back();
+  }
+  
+  // Augmented state vector (initial state error): ξ_0 = [e; u_{-1}]
   // where e = x_current - x_desired (state error)
   // and u_{-1} = u_ref + du_prev (previous velocity, not increment)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
@@ -762,7 +912,10 @@ void MPCController::build_mpc_matrices(
   P = P_dense.sparseView();
   
   // q vector (gradient)
-  q = S_u.transpose() * Q_bar * S_x * x_aug;
+  // q = S_u^T * Q_bar * (S_x * x_aug - x_ref_vec)
+  Eigen::VectorXd x_predicted = S_x * x_aug;
+  Eigen::VectorXd error_vec = x_predicted - x_ref_vec;
+  q = S_u.transpose() * Q_bar * error_vec;
   
   // Constraints: control limits
   // We use box constraints: l <= Δu <= u

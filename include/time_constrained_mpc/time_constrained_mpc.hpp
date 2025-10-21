@@ -60,11 +60,17 @@ public:
   // Path processing
   geometry_msgs::msg::PoseStamped calculate_lookahead_point();
   
+  // Temporal reference calculation
+  geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
+  std::vector<Eigen::Vector3d> get_reference_trajectory_horizon(
+    const rclcpp::Time &current_time, int N, double dt);
+  double calculate_temporal_error();
+  
   // MPC solver
   geometry_msgs::msg::Twist solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const nav_msgs::msg::Path &path);
+    const std::vector<Eigen::Vector3d> &reference_trajectory);
 
   // Command publication
   void publish_velocity_command(const geometry_msgs::msg::Twist &cmd);
@@ -90,7 +96,7 @@ private:
                                            const Eigen::Vector2d &control, 
                                            double dt);
   void build_mpc_matrices(const Eigen::Vector3d &current_state,
-                         const Eigen::Vector3d &desired_state,
+                         const std::vector<Eigen::Vector3d> &reference_trajectory,
                          const Eigen::Vector2d &u_ref,
                          Eigen::SparseMatrix<double> &P,
                          Eigen::VectorXd &q,
@@ -118,9 +124,11 @@ private:
   // State variables
   nav_msgs::msg::Path global_plan_;
   nav_msgs::msg::Odometry current_odom_;
+  rclcpp::Time path_start_time_;  // Time when path execution started
   bool initialized_{false};
   bool has_odom_{false};
   Eigen::Vector2d du_prev_{Eigen::Vector2d::Zero()};
+  double last_temporal_error_{0.0};  // For monitoring
 
   // MPC parameters
   double max_linear_vel_;
