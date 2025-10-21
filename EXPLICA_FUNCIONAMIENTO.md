@@ -7,7 +7,8 @@
 | $x_i$ | 3×1 | Estado del robot en el paso $i$: $[x, y, \theta]^T$ (posición x, y y orientación) |
 | $u_i$ | 2×1 | Control aplicado en el paso $i$: $[v, \omega]^T$ (velocidad lineal y angular) |
 | $\Delta u_i$ | 2×1 | Incremento de control: $u_i - u_{i-1}$ (cambio respecto al control anterior) |
-| $\xi$ | 5×1 | Estado aumentado: $[x, y, \theta, \Delta u_v, \Delta u_\omega]^T$ |
+| $z_k$ | 2×1 | Variable de memoria del estado aumentado: $z_k = \Delta u_{k-1}$ (almacena el incremento anterior) |
+| $\xi_k$ | 5×1 | Estado aumentado: $\xi_k = [x_k, y_k, \theta_k, z_{k,v}, z_{k,\omega}]^T = [x_k; z_k]$ donde $z_k = \Delta u_{k-1}$ |
 | $N$ | - | Número de pasos del horizonte de predicción (ej: 10) |
 | $\Delta t$ | - | Paso de tiempo del control (ej: 0.1s) |
 | $Q$ | 3×3 | Matriz de peso para el error de estado (penaliza desviaciones de posición/orientación) |
@@ -130,25 +131,194 @@ $$
 
 ### Modelo aumentado:
 
+**Notación clara del estado aumentado:**
+
+Definimos el estado aumentado como:
 $$
-\begin{bmatrix} x_{k+1} \\ \Delta u_k \end{bmatrix} = 
-\underbrace{\begin{bmatrix}
+\xi_k = \begin{bmatrix} x_k \\ z_k \end{bmatrix}
+$$
+
+Donde:
+- $x_k \in \mathbb{R}^3$ es el estado físico del robot: $[x, y, \theta]^T$
+- $z_k \in \mathbb{R}^2$ es la **memoria del incremento anterior**: $z_k = \Delta u_{k-1}$
+
+**Ecuación de evolución del estado aumentado:**
+
+$$
+\xi_{k+1} = \begin{bmatrix} x_{k+1} \\ z_{k+1} \end{bmatrix} = 
+\begin{bmatrix}
 A_d & B_d \\
-0_{2×3} & I_2
-\end{bmatrix}}_{A_{aug} \in \mathbb{R}^{5×5}} 
-\begin{bmatrix} x_k \\ \Delta u_{k-1} \end{bmatrix} +
-\underbrace{\begin{bmatrix}
+0_{2×3} & 0_{2×2}
+\end{bmatrix}
+\begin{bmatrix} x_k \\ z_k \end{bmatrix} +
+\begin{bmatrix}
 B_d \\
 I_2
-\end{bmatrix}}_{B_{aug} \in \mathbb{R}^{5×2}}
+\end{bmatrix}
 \Delta u_k
 $$
 
-**¿Por qué esto funciona?**
+**⚠️ Nota crítica:** La submatriz inferior derecha es $0_{2×2}$, **NO** $I_2$. Esto significa que $z_k$ NO se propaga al siguiente estado.
 
-La parte inferior de la ecuación ($\Delta u_k = 0 \cdot x_k + I_2 \cdot \Delta u_{k-1} + I_2 \cdot \Delta u_k$) simplemente "copia" el incremento actual para que esté disponible en el siguiente paso. Es como tener memoria del último cambio aplicado.
+**Descomponiendo en dos ecuaciones separadas:**
 
-**Ventaja del estado aumentado:** Ahora todos los estados futuros se pueden expresar **únicamente en función de los incrementos de control** $\Delta u_i$, que son nuestras variables de decisión en el optimizador.
+#### **Ecuación 1: Dinámica del robot**
+$$
+x_{k+1} = A_d \cdot x_k + B_d \cdot z_k + B_d \cdot \Delta u_k
+$$
+
+Como $z_k = \Delta u_{k-1} = u_{k-1} - u_{k-2}$, esto es equivalente a:
+$$
+x_{k+1} = A_d \cdot x_k + B_d \cdot (u_{k-1} - u_{k-2}) + B_d \cdot (u_k - u_{k-1})
+$$
+$$
+x_{k+1} = A_d \cdot x_k + B_d \cdot u_k - B_d \cdot u_{k-2}
+$$
+
+Esta ecuación describe la cinemática real del robot considerando el control actual y la "inercia" del control de hace 2 pasos.
+
+#### **Ecuación 2: Actualización de memoria (simple asignación)**
+$$
+z_{k+1} = 0_{2×3} \cdot x_k + 0_{2×2} \cdot z_k + I_2 \cdot \Delta u_k
+$$
+
+Simplificando:
+$$
+z_{k+1} = \Delta u_k
+$$
+
+**Verificación en términos de velocidades absolutas:**
+$$
+z_{k+1} = u_k - u_{k-1} \quad \text{✓ Correcto por definición}
+$$
+
+**Interpretación rigurosa:**
+
+La segunda ecuación **NO** es una ecuación dinámica. Es una **asignación directa** que dice:
+
+> "La variable de memoria $z$ en el siguiente paso es simplemente el incremento de control que aplicamos ahora"
+
+**Verificación completa en términos de velocidades absolutas:**
+
+```
+k = 0:
+  u_{-1} = [0, 0]       (velocidad inicial)
+  u_0 = [0.5, 0.1]      (optimizador decide)
+  z_0 = u_{-1} - u_{-2} = [0, 0]
+  Δu_0 = u_0 - u_{-1} = [0.5, 0.1]
+  
+  Actualización: z_1 = Δu_0 = u_0 - u_{-1} = [0.5, 0.1] ✓
+
+k = 1:
+  u_0 = [0.5, 0.1]      (control previo)
+  u_1 = [0.6, 0.15]     (optimizador decide)
+  z_1 = u_0 - u_{-1} = [0.5, 0.1]
+  Δu_1 = u_1 - u_0 = [0.1, 0.05]
+  
+  Actualización: z_2 = Δu_1 = u_1 - u_0 = [0.1, 0.05] ✓
+
+k = 2:
+  u_1 = [0.6, 0.15]     (control previo)
+  u_2 = [0.65, 0.18]    (optimizador decide)
+  z_2 = u_1 - u_0 = [0.1, 0.05]
+  Δu_2 = u_2 - u_1 = [0.05, 0.03]
+  
+  Actualización: z_3 = Δu_2 = u_2 - u_1 = [0.05, 0.03] ✓
+```
+
+**Por qué $z_k$ NO se suma:**
+
+Si tuviéramos $z_{k+1} = z_k + \Delta u_k$, entonces:
+$$z_{k+1} = (u_{k-1} - u_{k-2}) + (u_k - u_{k-1}) = u_k - u_{k-2}$$
+
+Pero por definición queremos:
+$$z_{k+1} = \Delta u_k = u_k - u_{k-1}$$
+
+**Por lo tanto, la matriz correcta debe tener $0_{2×2}$ en la posición inferior derecha, NO $I_2$.**
+
+**Formulación en términos de velocidades absolutas:**
+
+La dinámica completa del sistema en términos de las velocidades absolutas $u_k$ es:
+
+$$
+\xi_{k+1} = \begin{bmatrix} 
+A_d \cdot x_k + B_d \cdot u_k - B_d \cdot u_{k-2} \\ 
+u_k - u_{k-1}
+\end{bmatrix}
+$$
+
+Esto muestra claramente que:
+1. El estado del robot depende del control actual $u_k$ y el control de hace 2 pasos $u_{k-2}$
+2. La memoria simplemente almacena la diferencia entre controles consecutivos
+
+**Analogía en código:**
+
+```python
+# Estado aumentado en k
+x_k = [x, y, theta]
+z_k = u_k_minus_1 - u_k_minus_2  # Memoria = Δu_{k-1}
+
+# Optimizador decide el incremento
+delta_u_k = optimizador.solve()
+
+# Calculamos velocidad absoluta nueva
+u_k = u_k_minus_1 + delta_u_k
+
+# Dinámica del robot (usa u_k y u_k_minus_2)
+x_k_plus_1 = A_d @ x_k + B_d @ u_k - B_d @ u_k_minus_2
+
+# Actualización de memoria (simple asignación)
+z_k_plus_1 = u_k - u_k_minus_1  # = delta_u_k
+
+# Estado aumentado en k+1
+xi_k_plus_1 = [x_k_plus_1, z_k_plus_1]
+
+# Guardar para próxima iteración
+u_k_minus_2 = u_k_minus_1
+u_k_minus_1 = u_k
+```
+
+**Ventaja del estado aumentado:**
+
+Al mantener $\Delta u_{k-1}$ como parte del estado $\xi_k$, podemos:
+1. Expresar la predicción futura únicamente en términos de $\Delta u_0, \Delta u_1, ..., \Delta u_{N-1}$
+2. Penalizar cambios bruscos de control sin necesitar almacenar histórico externo
+3. Mantener un modelo lineal (estado aumentado evoluciona linealmente con $\Delta u_k$)
+
+### Ejemplo Numérico Completo (con velocidades absolutas)
+
+```
+Instante k=0:
+  u_{-1} = [0, 0]       (robot en reposo)
+  u_0 = ?               (por determinar)
+  x₀ = [0, 0, 0]ᵀ
+  z₀ = Δu_{-1} = [0, 0]ᵀ
+  
+  Optimizador decide: Δu₀ = [0.1, 0.05]ᵀ
+  Velocidad aplicada: u₀ = u_{-1} + Δu₀ = [0.1, 0.05]ᵀ
+  
+Instante k=1:
+  u_0 = [0.1, 0.05]ᵀ    (velocidad anterior)
+  u_1 = ?               (por determinar)
+  
+  Robot se movió: x₁ = A_d·x₀ + B_d·u₀ = [0.01, 0.0, 0.005]ᵀ
+  Memoria: z₁ = Δu₀ = u₀ - u_{-1} = [0.1, 0.05]ᵀ
+  Estado aumentado: ξ₁ = [0.01, 0.0, 0.005, 0.1, 0.05]ᵀ
+  
+  Optimizador decide: Δu₁ = [0.08, 0.03]ᵀ
+  Velocidad aplicada: u₁ = u₀ + Δu₁ = [0.18, 0.08]ᵀ
+  
+Instante k=2:
+  u_1 = [0.18, 0.08]ᵀ   (velocidad anterior)
+  
+  Robot se movió: x₂ = A_d·x₁ + B_d·u₁ - B_d·u_{-1} = [0.03, 0.001, 0.013]ᵀ
+  Memoria: z₂ = Δu₁ = u₁ - u₀ = [0.08, 0.03]ᵀ
+  Estado aumentado: ξ₂ = [0.03, 0.001, 0.013, 0.08, 0.03]ᵀ
+```
+
+**Observación clave:** La variable $z_k$ simplemente almacena $\Delta u_{k-1} = u_{k-1} - u_{k-2}$. La actualización es una asignación directa, **NO** una suma:
+
+$$z_{k+1} = \Delta u_k \quad \text{(NO es } z_{k+1} = z_k + \Delta u_k \text{)}$$
 
 ---
 

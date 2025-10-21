@@ -691,10 +691,14 @@ void MPCController::build_mpc_matrices(
   B_d(2, 1) = d_t_;
   
   // Augmented system matrices
+  // The augmented state is ξ_k = [x_k; z_k] where z_k = Δu_{k-1}
+  // The dynamics are: x_{k+1} = A_d·x_k + B_d·z_k + B_d·Δu_k
+  //                   z_{k+1} = Δu_k  (simple assignment, NOT z_k + Δu_k)
   Eigen::MatrixXd A_aug = Eigen::MatrixXd::Zero(dim_aug, dim_aug);
   A_aug.topLeftCorner(dim_x, dim_x) = A_d;
   A_aug.topRightCorner(dim_x, dim_u) = B_d;
-  A_aug.bottomRightCorner(dim_u, dim_u) = Eigen::Matrix2d::Identity();
+  // Note: bottomRightCorner remains 0_{2×2}, NOT I_2
+  // This ensures z_{k+1} = Δu_k (not z_{k+1} = z_k + Δu_k)
   
   Eigen::MatrixXd B_aug = Eigen::MatrixXd::Zero(dim_aug, dim_u);
   B_aug.topLeftCorner(dim_x, dim_u) = B_d;
