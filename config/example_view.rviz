@@ -27,6 +27,11 @@ Visualization Manager:
       Name: MPC Debug Path
       Topic: /mpc_debug_path
       Color: 0; 255; 0
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Robot Pose
+      Topic: /mpc_debug_pose
+      Color: 0; 0; 255
   Global Options:
     Fixed Frame: map
   Views:

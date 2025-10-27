@@ -15,9 +15,10 @@ MPCController::MPCController()
 MPCController::~MPCController() = default;
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-MPCController::on_configure(const rclcpp_lifecycle::State & state)
+MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_debug_path", 10);
+  debug_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_debug_pose", 10);
   
   // Determine which type of cmd_vel to use
   use_stamped_cmd_vel_ = this->declare_parameter<bool>("use_stamped_cmd_vel", false);
@@ -125,9 +126,10 @@ MPCController::on_configure(const rclcpp_lifecycle::State & state)
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-MPCController::on_activate(const rclcpp_lifecycle::State & state)
+MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_activate();
+  debug_pose_pub_->on_activate();
   
   // Activate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -160,9 +162,10 @@ MPCController::on_activate(const rclcpp_lifecycle::State & state)
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-MPCController::on_deactivate(const rclcpp_lifecycle::State & state)
+MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_deactivate();
+  debug_pose_pub_->on_deactivate();
   
   // Deactivate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -192,9 +195,10 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & state)
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-MPCController::on_cleanup(const rclcpp_lifecycle::State & state)
+MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
+  debug_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
@@ -207,9 +211,10 @@ MPCController::on_cleanup(const rclcpp_lifecycle::State & state)
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-MPCController::on_shutdown(const rclcpp_lifecycle::State & state)
+MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
+  debug_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
@@ -474,6 +479,8 @@ geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclc
       
       reference.header.stamp = target_time;
       reference.header.frame_id = global_plan_.header.frame_id;
+
+      debug_pose_pub_->publish(reference);
       
       return reference;
     }
@@ -533,6 +540,8 @@ double MPCController::calculate_temporal_error()
       closest_idx = i;
     }
   }
+
+  // TODO: Search only forward from closest_idx to find the temporally closest pose
   
   // Get the timestamp of that pose
   rclcpp::Time trajectory_time(global_plan_.poses[closest_idx].header.stamp);
@@ -656,7 +665,7 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
       cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
       cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
     } else {
-      RCLCPP_WARN(get_logger(), "MPC solver failed with status: %d", 
+      RCLCPP_WARN(get_logger(), "MPC solver failed with status: %lld", 
                   work->info ? work->info->status_val : -1);
       cmd.linear.x = 0.0;
       cmd.angular.z = 0.0;
@@ -777,7 +786,7 @@ void MPCController::reset_state()
 Eigen::Vector2d MPCController::differential_drive_model(
     const Eigen::Vector3d &state, 
     const Eigen::Vector2d &control, 
-    double dt)
+    double /*dt*/)
 {
   // Differential drive kinematics:
   // dx/dt = v * cos(theta)
@@ -786,7 +795,7 @@ Eigen::Vector2d MPCController::differential_drive_model(
   
   double theta = state(2);
   double v = control(0);
-  double omega = control(1);
+  // double omega = control(1);
   
   Eigen::Vector2d state_dot;
   state_dot(0) = v * std::cos(theta);  // dx
