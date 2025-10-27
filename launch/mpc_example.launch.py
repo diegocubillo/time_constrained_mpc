@@ -134,7 +134,7 @@ def generate_launch_description():
     # that sends a path to the MPC controller.
     path_cmd = [
         'ros2', 'run', 'time_constrained_mpc',
-        'send_example_path.py'
+        'send_maze_path.py'
     ]
     publish_path = TimerAction(
         period=5.0,
