@@ -899,11 +899,11 @@ void MPCController::build_mpc_matrices(
     x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory.back();
   }
   
-  // Augmented state vector (initial state error): ξ_0 = [e; u_{-1}]
-  // where e = x_current - x_desired (state error)
+  // Augmented state vector (initial state): ξ_0 = [x_current; u_{-1}]
+  // where x_current is the current robot state
   // and u_{-1} = u_ref + du_prev (previous velocity, not increment)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
-  x_aug.head(dim_x) = e;
+  x_aug.head(dim_x) = current_state;
   x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity (absolute)
   
   // P matrix (Hessian)
