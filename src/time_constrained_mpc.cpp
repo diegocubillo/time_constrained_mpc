@@ -45,6 +45,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   max_lookahead_dist_ = this->declare_parameter<double>("max_lookahead_dist", 0.9);
   goal_dist_tolerance_ = this->declare_parameter<double>("goal_dist_tolerance", 0.2);
   goal_theta_tolerance_ = this->declare_parameter<double>("goal_theta_tolerance", 0.1);
+  path_smoothing_window_ = this->declare_parameter<double>("path_smoothing_window", 0.5);
   
   // Frame IDs
   map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
@@ -121,7 +122,39 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   // Note: initialized_ will be set to true in on_activate()
   initialized_ = false;
 
+  // Log all configuration parameters
   RCLCPP_INFO(get_logger(), "MPCController on_configure() is called.");
+  RCLCPP_INFO(get_logger(), "=== MPC Configuration Parameters ===");
+  RCLCPP_INFO(get_logger(), "Controller frequency: %.1f Hz", 1.0 / d_t_);
+  RCLCPP_INFO(get_logger(), "Horizon: %.2f sec (%d steps)", horizon_sec_, horizon_steps_);
+  RCLCPP_INFO(get_logger(), "Control time step: %.3f sec", d_t_);
+  RCLCPP_INFO(get_logger(), "=== Velocity Limits ===");
+  RCLCPP_INFO(get_logger(), "Max linear velocity: %.2f m/s", max_linear_vel_);
+  RCLCPP_INFO(get_logger(), "Max angular velocity: %.2f rad/s", max_angular_vel_);
+  RCLCPP_INFO(get_logger(), "Max linear acceleration: %.2f m/s²", max_linear_accel_);
+  RCLCPP_INFO(get_logger(), "Max angular acceleration: %.2f rad/s²", max_angular_accel_);
+  RCLCPP_INFO(get_logger(), "=== Lookahead Configuration ===");
+  RCLCPP_INFO(get_logger(), "Lookahead time: %.2f sec", lookahead_time_);
+  RCLCPP_INFO(get_logger(), "Min lookahead distance: %.2f m", min_lookahead_dist_);
+  RCLCPP_INFO(get_logger(), "Max lookahead distance: %.2f m", max_lookahead_dist_);
+  RCLCPP_INFO(get_logger(), "=== Goal Tolerances ===");
+  RCLCPP_INFO(get_logger(), "Distance tolerance: %.2f m", goal_dist_tolerance_);
+  RCLCPP_INFO(get_logger(), "Theta tolerance: %.2f rad", goal_theta_tolerance_);
+  RCLCPP_INFO(get_logger(), "=== Path Processing ===");
+  RCLCPP_INFO(get_logger(), "Path smoothing window: %.2f m", path_smoothing_window_);
+  RCLCPP_INFO(get_logger(), "=== MPC Cost Weights ===");
+  RCLCPP_INFO(get_logger(), "Q (state tracking) [x, y, θ]: [%.1f, %.1f, %.1f]",
+              Q_(0, 0), Q_(1, 1), Q_(2, 2));
+  RCLCPP_INFO(get_logger(), "R (control effort) [v, ω]: [%.1f, %.1f]",
+              R_(0, 0), R_(1, 1));
+  RCLCPP_INFO(get_logger(), "R_d (control rate) [Δv, Δω]: [%.1f, %.1f]",
+              R_d_(0, 0), R_d_(1, 1));
+  RCLCPP_INFO(get_logger(), "=== Frame IDs ===");
+  RCLCPP_INFO(get_logger(), "Map frame: %s", map_frame_.c_str());
+  RCLCPP_INFO(get_logger(), "Base frame: %s", base_frame_.c_str());
+  RCLCPP_INFO(get_logger(), "Odom frame: %s", odom_frame_.c_str());
+  RCLCPP_INFO(get_logger(), "====================================");
+  
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
 
@@ -230,14 +263,20 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal_handle)
 {
   const auto goal = goal_handle->get_goal();
-  global_plan_ = goal->path;
+  auto original_path = goal->path;
   current_goal_handle_ = goal_handle;
   du_prev_ = Eigen::Vector2d::Zero();
   
   // Record when path execution starts
   path_start_time_ = this->now();
   
-  RCLCPP_INFO(get_logger(), "Received new path with %zu poses", global_plan_.poses.size());
+  RCLCPP_INFO(get_logger(), "Received new path with %zu poses", original_path.poses.size());
+  
+  // First, interpolate the path to increase point density
+  auto interpolated_path = interpolate_path(original_path, 0.1);  // 10cm spacing
+  
+  // Then smooth the interpolated path to handle sharp corners
+  global_plan_ = smooth_path(interpolated_path, path_smoothing_window_);
   
   // Validate that all timestamps are in the future
   if (!global_plan_.poses.empty()) {
@@ -292,16 +331,15 @@ void MPCController::control_loop()
     return;
   }
 
-  // Get current robot pose and velocity
+  // Get current robot pose, velocity and current time
   auto pose = get_robot_pose();
   auto velocity = get_robot_velocity();
+  rclcpp::Time current_time = this->now();
 
-  // Calculate temporal error for monitoring
-  double temporal_error = calculate_temporal_error();
-  last_temporal_error_ = temporal_error;
+  // Calculate temporal error only for monitoring
+  calculate_temporal_error(pose, current_time);
   
   // Get reference trajectory for the MPC horizon based on current time
-  rclcpp::Time current_time = this->now();
   auto reference_trajectory = get_reference_trajectory_horizon(current_time, horizon_steps_, d_t_);
   
   // Solve MPC with temporal references
@@ -421,6 +459,169 @@ geometry_msgs::msg::PoseStamped MPCController::calculate_lookahead_point()
   return lookahead;
 }
 
+// ----- PATH INTERPOLATION -----
+nav_msgs::msg::Path MPCController::interpolate_path(const nav_msgs::msg::Path &original_path,
+                                                     double target_spacing)
+{
+  nav_msgs::msg::Path interpolated_path;
+  interpolated_path.header = original_path.header;
+  
+  if (original_path.poses.size() < 2) {
+    // Not enough points to interpolate, return original
+    return original_path;
+  }
+  
+  RCLCPP_INFO(get_logger(), "Interpolating path with target spacing: %.2fm", target_spacing);
+  
+  // Always include the first point
+  interpolated_path.poses.push_back(original_path.poses[0]);
+  
+  // Interpolate between consecutive poses
+  for (size_t i = 0; i < original_path.poses.size() - 1; ++i) {
+    const auto &pose0 = original_path.poses[i];
+    const auto &pose1 = original_path.poses[i + 1];
+    
+    // Calculate distance between poses
+    double dx = pose1.pose.position.x - pose0.pose.position.x;
+    double dy = pose1.pose.position.y - pose0.pose.position.y;
+    double segment_dist = std::hypot(dx, dy);
+    
+    // Calculate time difference
+    rclcpp::Time t0(pose0.header.stamp);
+    rclcpp::Time t1(pose1.header.stamp);
+    double dt_total = (t1 - t0).seconds();
+    
+    // Calculate number of intermediate points needed
+    int num_interpolated = static_cast<int>(std::floor(segment_dist / target_spacing));
+    
+    // Add interpolated points
+    for (int j = 1; j <= num_interpolated; ++j) {
+      double ratio = static_cast<double>(j) / (num_interpolated + 1);
+      
+      geometry_msgs::msg::PoseStamped interp_pose;
+      interp_pose.header.frame_id = pose0.header.frame_id;
+      
+      // Interpolate position
+      interp_pose.pose.position.x = pose0.pose.position.x + ratio * dx;
+      interp_pose.pose.position.y = pose0.pose.position.y + ratio * dy;
+      interp_pose.pose.position.z = pose0.pose.position.z + 
+        ratio * (pose1.pose.position.z - pose0.pose.position.z);
+      
+      // Interpolate timestamp
+      rclcpp::Time interp_time = t0 + rclcpp::Duration::from_seconds(ratio * dt_total);
+      interp_pose.header.stamp = static_cast<builtin_interfaces::msg::Time>(interp_time);
+      
+      // Interpolate orientation (simple approach: use direction of motion)
+      double theta = std::atan2(dy, dx);
+      tf2::Quaternion q;
+      q.setRPY(0, 0, theta);
+      interp_pose.pose.orientation = tf2::toMsg(q);
+      
+      interpolated_path.poses.push_back(interp_pose);
+    }
+    
+    // Add the next original point (unless it's the last one, handled below)
+    if (i < original_path.poses.size() - 2) {
+      interpolated_path.poses.push_back(pose1);
+    }
+  }
+  
+  // Always include the last point
+  interpolated_path.poses.push_back(original_path.poses.back());
+  
+  RCLCPP_INFO(get_logger(), "Path interpolated: %zu -> %zu poses",
+              original_path.poses.size(), interpolated_path.poses.size());
+  
+  return interpolated_path;
+}
+
+// ----- PATH SMOOTHING -----
+nav_msgs::msg::Path MPCController::smooth_path(const nav_msgs::msg::Path &original_path,
+                                                double smoothing_window)
+{
+  nav_msgs::msg::Path smoothed_path;
+  smoothed_path.header = original_path.header;
+  
+  if (original_path.poses.size() < 3) {
+    // Not enough points to smooth, return original
+    return original_path;
+  }
+  
+  RCLCPP_INFO(get_logger(), "Smoothing path with %zu poses (window: %.2fm)",
+              original_path.poses.size(), smoothing_window);
+  
+  // Convert smoothing window from meters to number of points
+  // Calculate average spacing between points
+  double total_dist = 0.0;
+  for (size_t i = 0; i < original_path.poses.size() - 1; ++i) {
+    double dx = original_path.poses[i + 1].pose.position.x - 
+                original_path.poses[i].pose.position.x;
+    double dy = original_path.poses[i + 1].pose.position.y - 
+                original_path.poses[i].pose.position.y;
+    total_dist += std::hypot(dx, dy);
+  }
+  double avg_spacing = total_dist / (original_path.poses.size() - 1);
+  int window_points = std::max(2, static_cast<int>(smoothing_window / avg_spacing));
+  
+  RCLCPP_INFO(get_logger(), "Average spacing: %.3fm, window points: %d",
+              avg_spacing, window_points);
+  
+  // Apply moving average filter
+  for (size_t i = 0; i < original_path.poses.size(); ++i) {
+    geometry_msgs::msg::PoseStamped smoothed_pose;
+    smoothed_pose.header = original_path.poses[i].header;
+    
+    // Keep first and last points unchanged
+    if (i == 0 || i == original_path.poses.size() - 1) {
+      smoothed_pose = original_path.poses[i];
+      smoothed_path.poses.push_back(smoothed_pose);
+      continue;
+    }
+    
+    // Calculate window bounds
+    int start_idx = std::max(0, static_cast<int>(i) - window_points);
+    int end_idx = std::min(static_cast<int>(original_path.poses.size()) - 1,
+                           static_cast<int>(i) + window_points);
+    
+    // Average position
+    double sum_x = 0.0, sum_y = 0.0;
+    int count = 0;
+    for (int j = start_idx; j <= end_idx; ++j) {
+      sum_x += original_path.poses[j].pose.position.x;
+      sum_y += original_path.poses[j].pose.position.y;
+      count++;
+    }
+    
+    smoothed_pose.pose.position.x = sum_x / count;
+    smoothed_pose.pose.position.y = sum_y / count;
+    smoothed_pose.pose.position.z = original_path.poses[i].pose.position.z;
+    
+    // Recompute orientation based on smoothed positions
+    if (i < original_path.poses.size() - 1) {
+      double dx = smoothed_path.poses.size() > 0 ?
+                  (smoothed_pose.pose.position.x - smoothed_path.poses.back().pose.position.x) :
+                  (original_path.poses[i + 1].pose.position.x - smoothed_pose.pose.position.x);
+      double dy = smoothed_path.poses.size() > 0 ?
+                  (smoothed_pose.pose.position.y - smoothed_path.poses.back().pose.position.y) :
+                  (original_path.poses[i + 1].pose.position.y - smoothed_pose.pose.position.y);
+      double theta = std::atan2(dy, dx);
+      
+      tf2::Quaternion q;
+      q.setRPY(0, 0, theta);
+      smoothed_pose.pose.orientation = tf2::toMsg(q);
+    } else {
+      smoothed_pose.pose.orientation = original_path.poses[i].pose.orientation;
+    }
+    
+    smoothed_path.poses.push_back(smoothed_pose);
+  }
+  
+  RCLCPP_INFO(get_logger(), "Path smoothed: %zu -> %zu poses",
+              original_path.poses.size(), smoothed_path.poses.size());
+  
+  return smoothed_path;
+}
+
 // ----- TEMPORAL REFERENCE CALCULATION -----
 geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclcpp::Time &target_time)
 {
@@ -470,8 +671,6 @@ geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclc
         ratio * (global_plan_.poses[i + 1].pose.position.x - global_plan_.poses[i].pose.position.x);
       reference.pose.position.y = global_plan_.poses[i].pose.position.y + 
         ratio * (global_plan_.poses[i + 1].pose.position.y - global_plan_.poses[i].pose.position.y);
-      reference.pose.position.z = global_plan_.poses[i].pose.position.z + 
-        ratio * (global_plan_.poses[i + 1].pose.position.z - global_plan_.poses[i].pose.position.z);
       
       // SLERP interpolation of orientation (simplified: just use the target orientation)
       // For better results, implement proper quaternion SLERP
@@ -479,8 +678,6 @@ geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclc
       
       reference.header.stamp = target_time;
       reference.header.frame_id = global_plan_.header.frame_id;
-
-      debug_pose_pub_->publish(reference);
       
       return reference;
     }
@@ -504,6 +701,11 @@ std::vector<Eigen::Vector3d> MPCController::get_reference_trajectory_horizon(
     
     // Get the pose at that time
     auto pose = get_temporal_reference(target_time);
+
+    // Publish the first reference for debugging
+    if (i == 0) {
+      debug_pose_pub_->publish(pose);
+    }
     
     // Convert to Eigen vector
     Eigen::Vector3d ref;
@@ -517,14 +719,11 @@ std::vector<Eigen::Vector3d> MPCController::get_reference_trajectory_horizon(
   return references;
 }
 
-double MPCController::calculate_temporal_error()
+void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time)
 {
   if (global_plan_.poses.empty()) {
-    return 0.0;
+    return;
   }
-  
-  auto current_pose = get_robot_pose();
-  rclcpp::Time current_time = this->now();
   
   // Find the closest pose in the path spatially
   double min_dist = std::numeric_limits<double>::max();
@@ -548,8 +747,23 @@ double MPCController::calculate_temporal_error()
   
   // Calculate temporal error: positive = ahead of schedule, negative = behind
   double temporal_error = (trajectory_time - current_time).seconds();
+
+
   
-  return temporal_error;
+  // Log temporal tracking information
+  if (std::abs(temporal_error) > 0.5) {
+    if (temporal_error > 0) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Temporal tracking: %.2f s ahead of schedule", temporal_error);
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Temporal tracking: %.2f s behind schedule", std::abs(temporal_error));
+    }
+  }
+  RCLCPP_DEBUG(get_logger(),
+    "Temporal error: %.3f s", temporal_error);
+  
+  return;
 }
 
 // ----- MPC SOLVER -----
@@ -727,17 +941,6 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
     global_plan_.poses.back().pose.position.y - pose.pose.position.y);
   
   current_goal_handle_->publish_feedback(feedback);
-  
-  // Log temporal tracking information
-  if (std::abs(last_temporal_error_) > 0.5) {
-    if (last_temporal_error_ > 0) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Temporal tracking: %.2f s ahead of schedule", last_temporal_error_);
-    } else {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Temporal tracking: %.2f s behind schedule", std::abs(last_temporal_error_));
-    }
-  }
 }
 
 // ----- GOAL CHECK & RESET -----

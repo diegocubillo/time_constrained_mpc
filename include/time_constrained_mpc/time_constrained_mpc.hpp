@@ -59,12 +59,16 @@ public:
 
   // Path processing
   geometry_msgs::msg::PoseStamped calculate_lookahead_point();
+  nav_msgs::msg::Path interpolate_path(const nav_msgs::msg::Path &original_path,
+                                        double target_spacing = 0.1);
+  nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path &original_path,
+                                   double smoothing_window = 0.5);
   
   // Temporal reference calculation
   geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
   std::vector<Eigen::Vector3d> get_reference_trajectory_horizon(
     const rclcpp::Time &current_time, int N, double dt);
-  double calculate_temporal_error();
+  void calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time);
   
   // MPC solver
   geometry_msgs::msg::Twist solve_mpc(
@@ -129,7 +133,6 @@ private:
   bool initialized_{false};
   bool has_odom_{false};
   Eigen::Vector2d du_prev_{Eigen::Vector2d::Zero()};
-  double last_temporal_error_{0.0};  // For monitoring
 
   // MPC parameters
   double max_linear_vel_;
@@ -145,6 +148,7 @@ private:
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
   bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
+  double path_smoothing_window_;  // Smoothing window in meters
   
   // MPC weight matrices
   Eigen::Matrix3d Q_;  // State error weight
