@@ -19,6 +19,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_debug_path", 10);
   debug_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_debug_pose", 10);
+  furthest_theta_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_furthest_theta_pose", 10);
   
   // Determine which type of cmd_vel to use
   use_stamped_cmd_vel_ = this->declare_parameter<bool>("use_stamped_cmd_vel", false);
@@ -163,6 +164,7 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_activate();
   debug_pose_pub_->on_activate();
+  furthest_theta_pose_pub_->on_activate();
   
   // Activate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -199,6 +201,7 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_deactivate();
   debug_pose_pub_->on_deactivate();
+  furthest_theta_pose_pub_->on_deactivate();
   
   // Deactivate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -232,6 +235,7 @@ MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
   debug_pose_pub_.reset();
+  furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
@@ -248,6 +252,7 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
   debug_pose_pub_.reset();
+  furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
@@ -1118,6 +1123,26 @@ void MPCController::build_mpc_matrices(
   
   // Step 2: Calculate the furthest theta (bisector of the larger angle)
   double furthest_theta = calculate_furthest_theta(theta_curr_raw, theta_ref_raw);
+  furthest_theta = normalize_angle_around(furthest_theta, M_PI);  // Keep in [-π, π] for logging
+  
+  // Publish debug pose with furthest_theta orientation for visualization
+  if (furthest_theta_pose_pub_->get_subscription_count() > 0) {
+    geometry_msgs::msg::PoseStamped furthest_theta_pose;
+    furthest_theta_pose.header.stamp = this->now();
+    furthest_theta_pose.header.frame_id = "map";  // Same frame as robot pose
+    
+    // Use current robot position but with furthest_theta orientation
+    furthest_theta_pose.pose.position.x = current_state(0);
+    furthest_theta_pose.pose.position.y = current_state(1);
+    furthest_theta_pose.pose.position.z = 0.0;
+    
+    // Set orientation to furthest_theta
+    tf2::Quaternion q_furthest;
+    q_furthest.setRPY(0, 0, furthest_theta);
+    furthest_theta_pose.pose.orientation = tf2::toMsg(q_furthest);
+    
+    furthest_theta_pose_pub_->publish(furthest_theta_pose);
+  }
   
   // Step 3: Normalize all angles to [furthest_theta - 2π, furthest_theta]
   // This ensures the discontinuity is at furthest_theta, away from our working angles
@@ -1129,7 +1154,14 @@ void MPCController::build_mpc_matrices(
   double theta_lin = 0.7 * theta_ref_norm + 0.3 * theta_curr_norm;
   // Note: No need to normalize theta_lin since it's already in the correct range
 
-  
+  // Step 5: Create a normalized copy of the reference trajectory
+  // This preserves the original trajectory while allowing us to work with normalized angles
+  std::vector<Eigen::Vector3d> normalized_reference_trajectory = reference_trajectory;
+  for (size_t i = 0; i < normalized_reference_trajectory.size(); ++i) {
+    normalized_reference_trajectory[i](2) = normalize_angle_around(normalized_reference_trajectory[i](2), furthest_theta);
+  }
+
+  // ====================================================
   // State matrix A (3x3)
   Eigen::Matrix3d A_d = Eigen::Matrix3d::Identity();
   A_d(0, 2) = -u_ref(0) * std::sin(theta_lin) * d_t_;
@@ -1202,15 +1234,13 @@ void MPCController::build_mpc_matrices(
   
   // Build reference vector for the entire horizon
   Eigen::VectorXd x_ref_vec(dim_x * N);
-  for (int i = 0; i < N && i < static_cast<int>(reference_trajectory.size()); ++i) {
-    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory[i];
-    // Normalize reference angles to the same window as theta_curr and theta_ref
-    x_ref_vec(dim_x * i + 2) = normalize_angle_around(reference_trajectory[i](2), furthest_theta);
+  for (int i = 0; i < N && i < static_cast<int>(normalized_reference_trajectory.size()); ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = normalized_reference_trajectory[i];
+    // Angles are already normalized in the normalized_reference_trajectory
   }
-  // If reference_trajectory is shorter than N, repeat the last reference
-  for (int i = reference_trajectory.size(); i < N; ++i) {
-    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory.back();
-    x_ref_vec(dim_x * i + 2) = normalize_angle_around(reference_trajectory.back()(2), furthest_theta);
+  // If normalized_reference_trajectory is shorter than N, repeat the last reference
+  for (int i = normalized_reference_trajectory.size(); i < N; ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = normalized_reference_trajectory.back();
   }
   
   // Augmented state vector (initial state): ξ_0 = [x_current; u_{-1}]
