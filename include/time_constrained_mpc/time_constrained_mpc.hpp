@@ -95,7 +95,10 @@ public:
   void bond_timeout_callback();
 
 private:
-  // Helper methods for MPC
+  // Helper methods for MPC - Angular normalization strategy
+  double calculate_furthest_theta(double theta_current, double theta_ref);
+  double normalize_angle_around(double angle, double base);
+  
   Eigen::Vector2d differential_drive_model(const Eigen::Vector3d &state, 
                                            const Eigen::Vector2d &control, 
                                            double dt);

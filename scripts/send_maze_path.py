@@ -189,7 +189,7 @@ def main(args=None):
     # - 0.5m spacing between points
     # - 0.3 m/s maximum velocity
     node.send_maze_path(num_points=50, point_spacing=0.5,
-                        max_velocity=0.3)
+                        max_velocity=0.2)
 
     try:
         rclpy.spin(node)

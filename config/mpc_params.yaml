@@ -10,20 +10,28 @@ mpc_controller:
     
     # Velocity Limits
     max_linear_vel: 0.5         # m/s
-    max_angular_vel: 1.0        # rad/s
+    max_angular_vel: 1.5        # rad/s (increased for sharper turns)
+    max_linear_accel: 0.5       # m/s² (increased for quicker linear response)
+    max_angular_accel: 3.0      # rad/s² (increased for quicker angular response)
     
     # Lookahead Configuration
-    lookahead_time: 1.5         # seconds
-    min_lookahead_dist: 0.3     # meters
-    max_lookahead_dist: 0.9     # meters
+    # REDUCE lookahead to track closer points
+    lookahead_time: 0.8         # seconds
+    min_lookahead_dist: 0.2     # meters
+    max_lookahead_dist: 1.5     # meters
     
     # Goal Tolerances
     goal_dist_tolerance: 0.2    # meters
     goal_theta_tolerance: 0.1   # radians
     
+    # Path Smoothing
+    path_smoothing_window: 0.0  # meters - smooths sharp corners
+    
     # MPC Cost Weights
     # State tracking weights [x, y, theta]
-    Q_matrix_diag: [50.0, 50.0, 0.1]
+    # High position weights to prioritize getting close to path
+    # Low theta weight - orientation is flexible, only position matters
+    Q_matrix_diag: [300.0, 300.0, 0.01]
     
     # Control effort weights [v, omega]
     # NOTE: R_matrix is currently NOT USED (Option 2: only smooth movements)
@@ -31,7 +39,8 @@ mpc_controller:
     # R_matrix_diag: [1.0, 1.0]
     
     # Control rate weights (change/acceleration) [dv, domega]
-    R_d_matrix_diag: [10.0, 10.0]
+    # Moderate smoothness - allow angular changes for tight turns
+    R_d_matrix_diag: [20.0, 20.0]
     
     # Frame IDs
     map_frame: "map"
