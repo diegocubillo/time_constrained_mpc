@@ -1033,7 +1033,7 @@ double MPCController::calculate_furthest_theta(double theta_current, double thet
     // |diff| <= π, so the shorter path is 'diff'
     // The larger angle is in the opposite direction
     // Furthest point is at current + diff + π (opposite side)
-    return theta_current + diff + M_PI;
+    return theta_current + diff / 2.0 + M_PI;
   }
 }
 
