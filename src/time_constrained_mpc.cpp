@@ -17,10 +17,7 @@ MPCController::~MPCController() = default;
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
 {
-  path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_debug_path", 10);
-  predicted_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_predicted_path", 10);
-  debug_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_debug_pose", 10);
-  furthest_theta_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_furthest_theta_pose", 10);
+  path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_global_path", 10);
   
   // Determine which type of cmd_vel to use
   use_stamped_cmd_vel_ = this->declare_parameter<bool>("use_stamped_cmd_vel", false);
@@ -32,6 +29,14 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   } else {
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
     RCLCPP_INFO(get_logger(), "Using Twist for cmd_vel");
+  }
+
+  // Choose if debug topics are created based on parameter
+  debug_mpc_ = this->declare_parameter<bool>("debug_mpc", false);
+
+  if (debug_mpc_) {
+    predicted_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_predicted_path", 10);
+    debug_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_debug_pose", 10);
   }
 
   // Parameters
@@ -164,9 +169,10 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_activate();
-  predicted_path_pub_->on_activate();
-  debug_pose_pub_->on_activate();
-  furthest_theta_pose_pub_->on_activate();
+  if(debug_mpc_) {
+    predicted_path_pub_->on_activate();
+    debug_pose_pub_->on_activate();
+  }
   
   // Activate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -202,9 +208,10 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_deactivate();
-  predicted_path_pub_->on_deactivate();
-  debug_pose_pub_->on_deactivate();
-  furthest_theta_pose_pub_->on_deactivate();
+  if (debug_mpc_) {
+    predicted_path_pub_->on_deactivate();
+    debug_pose_pub_->on_deactivate();
+  }
   
   // Deactivate the appropriate cmd_vel publisher
   if (use_stamped_cmd_vel_) {
@@ -237,12 +244,13 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
-  predicted_path_pub_.reset();
-  debug_pose_pub_.reset();
-  furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  if(debug_mpc_) {
+    predicted_path_pub_.reset();
+    debug_pose_pub_.reset();
+  }
   
   // Destroy bond
   destroy_bond();
@@ -255,12 +263,13 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
-  predicted_path_pub_.reset();
-  debug_pose_pub_.reset();
-  furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  if(debug_mpc_) {
+    predicted_path_pub_.reset();
+    debug_pose_pub_.reset();
+  }
   
   // Destroy bond
   destroy_bond();
@@ -727,7 +736,7 @@ std::vector<Eigen::Vector4d> MPCController::get_reference_trajectory_horizon(
     auto pose = get_temporal_reference(target_time);
 
     // Publish the first reference for debugging
-    if (i == 0) {
+    if (i == 0 && debug_mpc_) {
       debug_pose_pub_->publish(pose);
     }
     
@@ -926,50 +935,62 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
       du_prev_(0) += delta_v;
       du_prev_(1) += delta_w;
       
-      // ===== PUBLISH PREDICTED TRAJECTORY =====
-      // Reconstruct the trajectory from the MPC solution without matrix multiplication
-      // This provides visualization of what the MPC predicts will happen
-      nav_msgs::msg::Path predicted_path;
-      predicted_path.header.frame_id = map_frame_;
-      predicted_path.header.stamp = this->now();
-      
-      // State variables for integration
-      double x_pred = current_state(0);
-      double y_pred = current_state(1);
-      double theta_pred = current_state(2);
-      double v_pred = u_ref(0) + du_prev_(0);
-      double w_pred = u_ref(1) + du_prev_(1);
-      
-      // Build predicted path step by step
-      for (int i = 0; i < horizon_steps_; ++i) {
-        // Update velocity with MPC solution (accumulate increments)
-        if (i > 0) {
-          v_pred += work->solution->x[2*i];      // Add Δv_i
-          w_pred += work->solution->x[2*i + 1];  // Add Δω_i
+      if(debug_mpc_) {
+        // ===== PUBLISH PREDICTED TRAJECTORY =====
+        // Reconstruct the trajectory from the MPC solution without matrix multiplication
+        // This provides visualization of what the MPC predicts will happen
+
+        nav_msgs::msg::Path predicted_path;
+        predicted_path.header.frame_id = map_frame_;
+        predicted_path.header.stamp = this->now();
+        
+        // State variables for integration [x, y, sin(theta), cos(theta)]
+        double x_pred = current_state(0);
+        double y_pred = current_state(1);
+        double s_theta_pred = current_state(2);  // sin(theta)
+        double c_theta_pred = current_state(3);  // cos(theta)
+        double v_pred = u_ref(0) + du_prev_(0);
+        double w_pred = u_ref(1) + du_prev_(1);
+        
+        // Build predicted path step by step
+        for (int i = 0; i < horizon_steps_; ++i) {
+          // Update velocity with MPC solution (accumulate increments)
+          if (i > 0) {
+            v_pred += work->solution->x[2*i];      // Add Δv_i
+            w_pred += work->solution->x[2*i + 1];  // Add Δω_i
+          }
+          
+          // Integrate kinematics with sin/cos representation (Euler forward)
+          // dx/dt = v * cos(theta) = v * c_theta
+          // dy/dt = v * sin(theta) = v * s_theta
+          // d(sin(theta))/dt = cos(theta) * omega
+          // d(cos(theta))/dt = -sin(theta) * omega
+          x_pred += v_pred * c_theta_pred * d_t_;
+          y_pred += v_pred * s_theta_pred * d_t_;
+          s_theta_pred += c_theta_pred * w_pred * d_t_;
+          c_theta_pred += -s_theta_pred * w_pred * d_t_;
+          
+          // Recover angle from sin/cos for visualization
+          double theta_pred = std::atan2(s_theta_pred, c_theta_pred);
+          
+          // Create pose for this prediction step
+          geometry_msgs::msg::PoseStamped pose;
+          pose.header = predicted_path.header;
+          pose.pose.position.x = x_pred;
+          pose.pose.position.y = y_pred;
+          pose.pose.position.z = 0.0;
+          
+          // Set orientation
+          tf2::Quaternion q;
+          q.setRPY(0, 0, theta_pred);
+          pose.pose.orientation = tf2::toMsg(q);
+          
+          predicted_path.poses.push_back(pose);
         }
         
-        // Integrate kinematics (simple Euler forward integration)
-        x_pred += v_pred * std::cos(theta_pred) * d_t_;
-        y_pred += v_pred * std::sin(theta_pred) * d_t_;
-        theta_pred += w_pred * d_t_;
-        
-        // Create pose for this prediction step
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header = predicted_path.header;
-        pose.pose.position.x = x_pred;
-        pose.pose.position.y = y_pred;
-        pose.pose.position.z = 0.0;
-        
-        // Set orientation
-        tf2::Quaternion q;
-        q.setRPY(0, 0, theta_pred);
-        pose.pose.orientation = tf2::toMsg(q);
-        
-        predicted_path.poses.push_back(pose);
+        // Publish the predicted trajectory
+        predicted_path_pub_->publish(predicted_path);
       }
-      
-      // Publish the predicted trajectory
-      predicted_path_pub_->publish(predicted_path);
       
       // Saturate controls as safety measure
       // (Should not be necessary if constraints are properly set, but kept as failsafe)

@@ -26,6 +26,9 @@ mpc_controller:
     
     # Path Smoothing
     path_smoothing_window: 0.0  # meters - smooths sharp corners
+
+    # Enable MPC Debugging Output
+    debug_mpc: false
     
     # MPC Cost Weights
     # State tracking weights [x, y, sin(theta), cos(theta)]
