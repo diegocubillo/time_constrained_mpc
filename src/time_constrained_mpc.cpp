@@ -18,6 +18,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_debug_path", 10);
+  predicted_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_predicted_path", 10);
   debug_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_debug_pose", 10);
   furthest_theta_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("mpc_furthest_theta_pose", 10);
   
@@ -60,19 +61,19 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   double controller_frequency = this->declare_parameter<double>("controller_frequency", 10.0);
   d_t_ = 1.0 / controller_frequency;
   
-  // MPC weight matrices Q[x, y, theta], R[v, w], R_d[dv, dw]
+  // MPC weight matrices Q[x, y, s_theta, c_theta], R[v, w], R_d[dv, dw]
   std::vector<double> q_diag = this->declare_parameter<std::vector<double>>(
-    "Q_matrix_diag", {10.0, 10.0, 1.0});
+    "Q_matrix_diag", {10.0, 10.0, 1.0, 1.0});
   std::vector<double> r_diag = this->declare_parameter<std::vector<double>>(
     "R_matrix_diag", {1.0, 1.0});
   std::vector<double> rd_diag = this->declare_parameter<std::vector<double>>(
     "R_d_matrix_diag", {10.0, 10.0});
   
-  Q_ = Eigen::Matrix3d::Zero();
+  Q_ = Eigen::Matrix4d::Zero();
   R_ = Eigen::Matrix2d::Zero();
   R_d_ = Eigen::Matrix2d::Zero();
   
-  for (size_t i = 0; i < 3; ++i) {
+  for (size_t i = 0; i < 4; ++i) {
     Q_(i, i) = q_diag[i];
   }
   for (size_t i = 0; i < 2; ++i) {
@@ -144,8 +145,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   RCLCPP_INFO(get_logger(), "=== Path Processing ===");
   RCLCPP_INFO(get_logger(), "Path smoothing window: %.2f m", path_smoothing_window_);
   RCLCPP_INFO(get_logger(), "=== MPC Cost Weights ===");
-  RCLCPP_INFO(get_logger(), "Q (state tracking) [x, y, θ]: [%.1f, %.1f, %.1f]",
-              Q_(0, 0), Q_(1, 1), Q_(2, 2));
+  RCLCPP_INFO(get_logger(), "Q (state tracking) [x, y, sin(θ), cos(θ)]: [%.1f, %.1f, %.1f, %.1f]",
+              Q_(0, 0), Q_(1, 1), Q_(2, 2), Q_(3, 3));
   RCLCPP_INFO(get_logger(), "R (control effort) [v, ω]: [%.1f, %.1f]",
               R_(0, 0), R_(1, 1));
   RCLCPP_INFO(get_logger(), "R_d (control rate) [Δv, Δω]: [%.1f, %.1f]",
@@ -163,6 +164,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_activate();
+  predicted_path_pub_->on_activate();
   debug_pose_pub_->on_activate();
   furthest_theta_pose_pub_->on_activate();
   
@@ -200,6 +202,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_->on_deactivate();
+  predicted_path_pub_->on_deactivate();
   debug_pose_pub_->on_deactivate();
   furthest_theta_pose_pub_->on_deactivate();
   
@@ -234,6 +237,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
+  predicted_path_pub_.reset();
   debug_pose_pub_.reset();
   furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
@@ -251,6 +255,7 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 {
   path_pub_.reset();
+  predicted_path_pub_.reset();
   debug_pose_pub_.reset();
   furthest_theta_pose_pub_.reset();
   cmd_vel_stamped_pub_.reset();
@@ -708,10 +713,10 @@ geometry_msgs::msg::PoseStamped MPCController::get_temporal_reference(const rclc
   return reference;
 }
 
-std::vector<Eigen::Vector3d> MPCController::get_reference_trajectory_horizon(
+std::vector<Eigen::Vector4d> MPCController::get_reference_trajectory_horizon(
     const rclcpp::Time &current_time, int N, double dt)
 {
-  std::vector<Eigen::Vector3d> references;
+  std::vector<Eigen::Vector4d> references;
   references.reserve(N);
   
   for (int i = 0; i < N; ++i) {
@@ -726,11 +731,13 @@ std::vector<Eigen::Vector3d> MPCController::get_reference_trajectory_horizon(
       debug_pose_pub_->publish(pose);
     }
     
-    // Convert to Eigen vector
-    Eigen::Vector3d ref;
+    // Convert to Eigen vector [x, y, sin(theta), cos(theta)]
+    double theta = tf2::getYaw(pose.pose.orientation);
+    Eigen::Vector4d ref;
     ref(0) = pose.pose.position.x;
     ref(1) = pose.pose.position.y;
-    ref(2) = tf2::getYaw(pose.pose.orientation);  // Already in [-π, π]
+    ref(2) = std::sin(theta);
+    ref(3) = std::cos(theta);
     
     references.push_back(ref);
   }
@@ -789,7 +796,7 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
 geometry_msgs::msg::Twist MPCController::solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector3d> &reference_trajectory)
+    const std::vector<Eigen::Vector4d> &reference_trajectory)
 {
   geometry_msgs::msg::Twist cmd;
   
@@ -799,11 +806,15 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
     return cmd;
   }
   
-  // Extract current state [x, y, theta]
+  // Extract current state [x, y, sin(theta), cos(theta)]
   double current_x = pose.pose.position.x;
   double current_y = pose.pose.position.y;
-  double current_theta = tf2::getYaw(pose.pose.orientation);  // Already in [-π, π]
-  Eigen::Vector3d current_state(current_x, current_y, current_theta);
+  double current_theta = tf2::getYaw(pose.pose.orientation);
+  Eigen::Vector4d current_state;
+  current_state(0) = current_x;
+  current_state(1) = current_y;
+  current_state(2) = std::sin(current_theta);
+  current_state(3) = std::cos(current_theta);
   
   // Reference control (based on current velocity)
   double vt = vel.linear.x;
@@ -885,13 +896,80 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
     osqp_solve(work);
     
     if (work->solution && work->info->status_val > 0) {
-      // Extract first control input (MPC receding horizon)
-      double u_v = work->solution->x[0] + du_prev_(0) + u_ref(0);
-      double u_w = work->solution->x[1] + du_prev_(1) + u_ref(1);
+      // ===== EXTRACTION OF MPC SOLUTION =====
+      // The OSQP solver returns: Δu* = [Δv_0, Δω_0, Δv_1, Δω_1, ..., Δv_{N-1}, Δω_{N-1}]
+      //
+      // Our augmented state formulation is: ξ_k = [x_k; u_{k-1}]
+      // where u_{k-1} is the PREVIOUS control (absolute velocity, not increment)
+      //
+      // In build_mpc_matrices(), we set:
+      //   u_{-1} = u_ref + du_prev_
+      // where:
+      //   - u_ref = current measured velocity from odometry (v_odom, ω_odom)
+      //   - du_prev_ = increment applied in the previous MPC iteration
+      //
+      // The MPC solution gives us Δu_0, which represents the change from u_{-1}:
+      //   u_0 = u_{-1} + Δu_0 = (u_ref + du_prev_) + Δu_0
+      //
+      // For receding horizon control, we apply only the first control:
+      double delta_v = work->solution->x[0];  // Δv_0
+      double delta_w = work->solution->x[1];  // Δω_0
       
-      // Update previous control increment
-      du_prev_(0) = work->solution->x[0];
-      du_prev_(1) = work->solution->x[1];
+      // Calculate absolute velocity to command
+      // u_0 = u_{-1} + Δu_0
+      double u_v = u_ref(0) + du_prev_(0) + delta_v;
+      double u_w = u_ref(1) + du_prev_(1) + delta_w;
+      
+      // Update du_prev_ for next iteration
+      // Store the TOTAL increment from u_ref (odometry reading)
+      // This way, if odometry lags or has noise, we maintain consistency
+      du_prev_(0) += delta_v;
+      du_prev_(1) += delta_w;
+      
+      // ===== PUBLISH PREDICTED TRAJECTORY =====
+      // Reconstruct the trajectory from the MPC solution without matrix multiplication
+      // This provides visualization of what the MPC predicts will happen
+      nav_msgs::msg::Path predicted_path;
+      predicted_path.header.frame_id = map_frame_;
+      predicted_path.header.stamp = this->now();
+      
+      // State variables for integration
+      double x_pred = current_state(0);
+      double y_pred = current_state(1);
+      double theta_pred = current_state(2);
+      double v_pred = u_ref(0) + du_prev_(0);
+      double w_pred = u_ref(1) + du_prev_(1);
+      
+      // Build predicted path step by step
+      for (int i = 0; i < horizon_steps_; ++i) {
+        // Update velocity with MPC solution (accumulate increments)
+        if (i > 0) {
+          v_pred += work->solution->x[2*i];      // Add Δv_i
+          w_pred += work->solution->x[2*i + 1];  // Add Δω_i
+        }
+        
+        // Integrate kinematics (simple Euler forward integration)
+        x_pred += v_pred * std::cos(theta_pred) * d_t_;
+        y_pred += v_pred * std::sin(theta_pred) * d_t_;
+        theta_pred += w_pred * d_t_;
+        
+        // Create pose for this prediction step
+        geometry_msgs::msg::PoseStamped pose;
+        pose.header = predicted_path.header;
+        pose.pose.position.x = x_pred;
+        pose.pose.position.y = y_pred;
+        pose.pose.position.z = 0.0;
+        
+        // Set orientation
+        tf2::Quaternion q;
+        q.setRPY(0, 0, theta_pred);
+        pose.pose.orientation = tf2::toMsg(q);
+        
+        predicted_path.poses.push_back(pose);
+      }
+      
+      // Publish the predicted trajectory
+      predicted_path_pub_->publish(predicted_path);
       
       // Saturate controls as safety measure
       // (Should not be necessary if constraints are properly set, but kept as failsafe)
@@ -1006,92 +1084,29 @@ void MPCController::reset_state()
 
 // ----- MPC HELPER FUNCTIONS -----
 
-/**
- * @brief Calculate the furthest angle (bisector of the larger angle > 180°)
- * 
- * This function finds the angle that bisects the LARGER of the two possible
- * angular intervals between theta_current and theta_ref. This angle represents
- * the direction we want to AVOID, creating a safe normalization window.
- * 
- * The algorithm simply checks which "side" has the larger angular distance.
- * 
- * @param theta_current Current robot orientation (any range)
- * @param theta_ref Reference orientation (any range)
- * @return Furthest angle (bisector of the larger angular interval)
- */
-double MPCController::calculate_furthest_theta(double theta_current, double theta_ref)
-{
-  // Calculate the raw difference
-  double diff = theta_ref - theta_current;
-  
-  // Determine which side has the larger angle (> π)
-  // If |diff| > π, then the shorter path is on the opposite side
-  if (diff > M_PI) {
-    // The larger angle is on the "negative" side
-    // Furthest point is at current + diff/2
-    return theta_current + diff / 2.0;
-  } else if (diff < -M_PI) {
-    // The larger angle is on the "positive" side
-    // Furthest point is at current + diff/2
-    return theta_current + diff / 2.0;
-  } else {
-    // |diff| <= π, so the shorter path is 'diff'
-    // The larger angle is in the opposite direction
-    // Furthest point is at current + diff + π (opposite side)
-    return theta_current + diff / 2.0 + M_PI;
-  }
-}
-
-/**
- * @brief Normalize angle to a custom range [base - 2π, base]
- * 
- * This normalization ensures all angles fall within a 2π window that avoids
- * the discontinuity at 'base'. This is critical for MPC because it prevents
- * the linearization matrices from having discontinuous coefficients.
- * 
- * Simple modular arithmetic: just check which "side" of the window we're on.
- * 
- * @param angle The angle to normalize (any range)
- * @param base The upper bound of the normalization window
- * @return Normalized angle in [base - 2π, base]
- */
-double MPCController::normalize_angle_around(double angle, double base)
-{
-  // Shift angle into the window [base - 2π, base]
-  // Just need to check if we're above or below the window
-  while (angle > base) {
-    angle -= 2.0 * M_PI;
-  }
-  while (angle < base - 2.0 * M_PI) {
-    angle += 2.0 * M_PI;
-  }
-  return angle;
-}
-
 Eigen::Vector2d MPCController::differential_drive_model(
-    const Eigen::Vector3d &state, 
+    const Eigen::Vector4d &state, 
     const Eigen::Vector2d &control, 
     double /*dt*/)
 {
-  // Differential drive kinematics:
-  // dx/dt = v * cos(theta)
-  // dy/dt = v * sin(theta)
-  // dtheta/dt = omega
+  // Differential drive kinematics with sin/cos representation:
+  // dx/dt = v * cos(theta) = v * c_theta
+  // dy/dt = v * sin(theta) = v * s_theta
   
-  double theta = state(2);
+  double s_theta = state(2);  // sin(theta)
+  double c_theta = state(3);  // cos(theta)
   double v = control(0);
-  // double omega = control(1);
   
   Eigen::Vector2d state_dot;
-  state_dot(0) = v * std::cos(theta);  // dx
-  state_dot(1) = v * std::sin(theta);  // dy
+  state_dot(0) = v * c_theta;  // dx
+  state_dot(1) = v * s_theta;  // dy
   
   return state_dot;
 }
 
 void MPCController::build_mpc_matrices(
-    const Eigen::Vector3d &current_state,
-    const std::vector<Eigen::Vector3d> &reference_trajectory,
+    const Eigen::Vector4d &current_state,
+    const std::vector<Eigen::Vector4d> &reference_trajectory,
     const Eigen::Vector2d &u_ref,
     Eigen::SparseMatrix<double> &P,
     Eigen::VectorXd &q,
@@ -1099,79 +1114,50 @@ void MPCController::build_mpc_matrices(
     Eigen::VectorXd &l,
     Eigen::VectorXd &u)
 {
-  const int nx = 3;  // state dimension [x, y, theta]
+  const int nx = 4;  // state dimension [x, y, sin(theta), cos(theta)]
   const int nu = 2;  // control dimension [v, omega]
   const int N = horizon_steps_;
   
-  // Augmented state: [x, y, theta, du_v, du_omega]
+  // Augmented state: [x, y, sin(theta), cos(theta), u_v, u_omega]
   const int dim_x = nx;
   const int dim_u = nu;
-  const int dim_aug = dim_x + dim_u;  // 5
+  const int dim_aug = dim_x + dim_u;  // 6
   
   // Linearized dynamics around reference trajectory
   // Use the first reference for linearization
-  Eigen::Vector3d ref_state = reference_trajectory.empty() ? 
-    Eigen::Vector3d::Zero() : reference_trajectory[0];
+  Eigen::Vector4d ref_state = reference_trajectory.empty() ? 
+    Eigen::Vector4d::Zero() : reference_trajectory[0];
   
-  // ===== ADVANCED ANGULAR NORMALIZATION STRATEGY =====
-  // Instead of always normalizing to [-π, π], we create a 2π window
-  // centered around the "furthest angle" to avoid discontinuities in the MPC matrices.
-  //
-  // Step 1: Get raw angles (no pre-normalization needed)
-  double theta_curr_raw = current_state(2);
-  double theta_ref_raw = ref_state(2);
+  // Extract sin and cos components for linearization
+  double s_ref = ref_state(2);  // sin(theta_ref)
+  double c_ref = ref_state(3);  // cos(theta_ref)
   
-  // Step 2: Calculate the furthest theta (bisector of the larger angle)
-  double furthest_theta = calculate_furthest_theta(theta_curr_raw, theta_ref_raw);
-  furthest_theta = normalize_angle_around(furthest_theta, M_PI);  // Keep in [-π, π] for logging
-  
-  // Publish debug pose with furthest_theta orientation for visualization
-  if (furthest_theta_pose_pub_->get_subscription_count() > 0) {
-    geometry_msgs::msg::PoseStamped furthest_theta_pose;
-    furthest_theta_pose.header.stamp = this->now();
-    furthest_theta_pose.header.frame_id = "map";  // Same frame as robot pose
-    
-    // Use current robot position but with furthest_theta orientation
-    furthest_theta_pose.pose.position.x = current_state(0);
-    furthest_theta_pose.pose.position.y = current_state(1);
-    furthest_theta_pose.pose.position.z = 0.0;
-    
-    // Set orientation to furthest_theta
-    tf2::Quaternion q_furthest;
-    q_furthest.setRPY(0, 0, furthest_theta);
-    furthest_theta_pose.pose.orientation = tf2::toMsg(q_furthest);
-    
-    furthest_theta_pose_pub_->publish(furthest_theta_pose);
-  }
-  
-  // Step 3: Normalize all angles to [furthest_theta - 2π, furthest_theta]
-  // This ensures the discontinuity is at furthest_theta, away from our working angles
-  double theta_curr_norm = normalize_angle_around(theta_curr_raw, furthest_theta);
-  double theta_ref_norm = normalize_angle_around(theta_ref_raw, furthest_theta);
-  
-  // Step 4: Linearization angle (blend between current and reference)
-  // Now we can safely blend in linear space since both angles are in the same cycle
-  double theta_lin = 0.7 * theta_ref_norm + 0.3 * theta_curr_norm;
-  // Note: No need to normalize theta_lin since it's already in the correct range
-
-  // Step 5: Create a normalized copy of the reference trajectory
-  // This preserves the original trajectory while allowing us to work with normalized angles
-  std::vector<Eigen::Vector3d> normalized_reference_trajectory = reference_trajectory;
-  for (size_t i = 0; i < normalized_reference_trajectory.size(); ++i) {
-    normalized_reference_trajectory[i](2) = normalize_angle_around(normalized_reference_trajectory[i](2), furthest_theta);
-  }
-
   // ====================================================
-  // State matrix A (3x3)
-  Eigen::Matrix3d A_d = Eigen::Matrix3d::Identity();
-  A_d(0, 2) = -u_ref(0) * std::sin(theta_lin) * d_t_;
-  A_d(1, 2) = u_ref(0) * std::cos(theta_lin) * d_t_;
+  // Linearized dynamics with sin/cos representation:
+  // State: [x, y, s_theta, c_theta] where s_theta = sin(theta), c_theta = cos(theta)
+  //
+  // Dynamics:
+  //   dx/dt = v * cos(theta) = v * c_theta
+  //   dy/dt = v * sin(theta) = v * s_theta
+  //   d(sin(theta))/dt = cos(theta) * dtheta/dt = c_theta * omega
+  //   d(cos(theta))/dt = -sin(theta) * dtheta/dt = -s_theta * omega
+  //
+  // Linearization around reference (s_ref, c_ref, v_ref, omega_ref):
+  //   s_{k+1} ≈ s_k + c_ref * omega * dt
+  //   c_{k+1} ≈ c_k - s_ref * omega * dt
+  //
+  // State matrix A_d (4x4) - Discretized using Euler forward:
+  Eigen::Matrix4d A_d = Eigen::Matrix4d::Identity();
+  A_d(0, 3) = u_ref(0) * d_t_;        // dx depends on c_theta
+  A_d(1, 2) = u_ref(0) * d_t_;        // dy depends on s_theta
+  // s_theta and c_theta evolution from angular velocity will be in B matrix
   
-  // Control matrix B (3x2)
+  // Control matrix B_d (4x2) - Maps [v, omega] to state derivatives
   Eigen::MatrixXd B_d = Eigen::MatrixXd::Zero(dim_x, dim_u);
-  B_d(0, 0) = std::cos(theta_lin) * d_t_;
-  B_d(1, 0) = std::sin(theta_lin) * d_t_;
-  B_d(2, 1) = d_t_;
+  B_d(0, 0) = c_ref * d_t_;           // dx/dv = c_theta * dt
+  B_d(1, 0) = s_ref * d_t_;           // dy/dv = s_theta * dt
+  B_d(2, 1) = c_ref * d_t_;           // ds_theta/domega = c_theta * dt
+  B_d(3, 1) = -s_ref * d_t_;          // dc_theta/domega = -s_theta * dt
   
   // Augmented system matrices
   // The augmented state is ξ_k = [x_k; u_{k-1}]
@@ -1192,9 +1178,9 @@ void MPCController::build_mpc_matrices(
   B_aug.topLeftCorner(dim_x, dim_u) = B_d;
   B_aug.bottomLeftCorner(dim_u, dim_u) = Eigen::Matrix2d::Identity();
   
-  // Output matrix C (3x5)
+  // Output matrix C (4x6)
   Eigen::MatrixXd C_aug = Eigen::MatrixXd::Zero(dim_x, dim_aug);
-  C_aug.topLeftCorner(dim_x, dim_x) = Eigen::Matrix3d::Identity();
+  C_aug.topLeftCorner(dim_x, dim_x) = Eigen::Matrix4d::Identity();
   
   // Build prediction matrices
   Eigen::MatrixXd S_x = Eigen::MatrixXd::Zero(dim_x * N, dim_aug);
@@ -1234,22 +1220,19 @@ void MPCController::build_mpc_matrices(
   
   // Build reference vector for the entire horizon
   Eigen::VectorXd x_ref_vec(dim_x * N);
-  for (int i = 0; i < N && i < static_cast<int>(normalized_reference_trajectory.size()); ++i) {
-    x_ref_vec.segment(dim_x * i, dim_x) = normalized_reference_trajectory[i];
-    // Angles are already normalized in the normalized_reference_trajectory
+  for (int i = 0; i < N && i < static_cast<int>(reference_trajectory.size()); ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory[i];
   }
-  // If normalized_reference_trajectory is shorter than N, repeat the last reference
-  for (int i = normalized_reference_trajectory.size(); i < N; ++i) {
-    x_ref_vec.segment(dim_x * i, dim_x) = normalized_reference_trajectory.back();
+  // If reference_trajectory is shorter than N, repeat the last reference
+  for (int i = reference_trajectory.size(); i < N; ++i) {
+    x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory.back();
   }
   
   // Augmented state vector (initial state): ξ_0 = [x_current; u_{-1}]
-  // where x_current is the current robot state
+  // where x_current is the current robot state [x, y, sin(theta), cos(theta)]
   // and u_{-1} = u_ref + du_prev (previous velocity, not increment)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = current_state;
-  // Use the normalized current angle (already computed above)
-  x_aug(2) = theta_curr_norm;
   x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity (absolute)
   
   // P matrix (Hessian)
@@ -1261,20 +1244,10 @@ void MPCController::build_mpc_matrices(
   // q = S_u^T * Q_bar * (S_x * x_aug - x_ref_vec)
   Eigen::VectorXd x_predicted = S_x * x_aug;
   
-  // Normalize predicted angles to the same window
-  // This is CRITICAL: matrix operations can produce angles outside our window
-  for (int i = 0; i < N; ++i) {
-    x_predicted(dim_x * i + 2) = normalize_angle_around(x_predicted(dim_x * i + 2), furthest_theta);
-  }
-  
   // Calculate error vector
-  // Since all angles are now in the same 2π window [furthest_theta - 2π, furthest_theta],
-  // the subtraction x_predicted - x_ref_vec gives the correct angular error automatically
+  // With sin/cos representation, no angle normalization is needed!
+  // The error is computed directly in the continuous sin/cos space
   Eigen::VectorXd error_vec = x_predicted - x_ref_vec;
-  
-  // Note: No need to re-normalize angular errors! Since both theta_pred and theta_ref
-  // are in the same continuous 2π window, their difference is already the shortest path.
-  // This is the KEY ADVANTAGE of the furthest_theta normalization strategy.
   
   q = S_u.transpose() * Q_bar * error_vec;
   

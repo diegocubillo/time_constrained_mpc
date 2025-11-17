@@ -66,7 +66,7 @@ public:
   
   // Temporal reference calculation
   geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
-  std::vector<Eigen::Vector3d> get_reference_trajectory_horizon(
+  std::vector<Eigen::Vector4d> get_reference_trajectory_horizon(
     const rclcpp::Time &current_time, int N, double dt);
   void calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time);
   
@@ -74,7 +74,7 @@ public:
   geometry_msgs::msg::Twist solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector3d> &reference_trajectory);
+    const std::vector<Eigen::Vector4d> &reference_trajectory);
 
   // Command publication
   void publish_velocity_command(const geometry_msgs::msg::Twist &cmd);
@@ -95,15 +95,12 @@ public:
   void bond_timeout_callback();
 
 private:
-  // Helper methods for MPC - Angular normalization strategy
-  double calculate_furthest_theta(double theta_current, double theta_ref);
-  double normalize_angle_around(double angle, double base);
-  
-  Eigen::Vector2d differential_drive_model(const Eigen::Vector3d &state, 
+  // Helper methods for MPC
+  Eigen::Vector2d differential_drive_model(const Eigen::Vector4d &state, 
                                            const Eigen::Vector2d &control, 
                                            double dt);
-  void build_mpc_matrices(const Eigen::Vector3d &current_state,
-                         const std::vector<Eigen::Vector3d> &reference_trajectory,
+  void build_mpc_matrices(const Eigen::Vector4d &current_state,
+                         const std::vector<Eigen::Vector4d> &reference_trajectory,
                          const Eigen::Vector2d &u_ref,
                          Eigen::SparseMatrix<double> &P,
                          Eigen::VectorXd &q,
@@ -115,6 +112,7 @@ private:
   std::shared_ptr<rclcpp::TimerBase> timer_path_pub_;
   std::shared_ptr<rclcpp::TimerBase> timer_control_loop_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr predicted_path_pub_;
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr debug_pose_pub_;
@@ -155,7 +153,7 @@ private:
   double path_smoothing_window_;  // Smoothing window in meters
   
   // MPC weight matrices
-  Eigen::Matrix3d Q_;  // State error weight
+  Eigen::Matrix4d Q_;  // State error weight [x, y, s_theta, c_theta]
   Eigen::Matrix2d R_;  // Control weight
   Eigen::Matrix2d R_d_;  // Control rate weight
   

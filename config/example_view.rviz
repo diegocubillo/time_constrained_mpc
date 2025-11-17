@@ -32,11 +32,6 @@ Visualization Manager:
       Name: Robot Pose
       Topic: /mpc_debug_pose
       Color: 0; 0; 255
-    - Class: rviz_default_plugins/Pose
-      Enabled: true
-      Name: Robot Pose
-      Topic: /mpc_furthest_theta_pose
-      Color: 0; 255; 255
   Global Options:
     Fixed Frame: map
   Views:
