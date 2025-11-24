@@ -1,12 +1,12 @@
 mpc_controller:
   ros__parameters:
-    # MPC Configuration
-    controller_frequency: 10.0  # Hz
-    horizon_sec: 2.0            # seconds
-    horizon_steps: 10           # prediction steps
+    # # MPC Configuration
+    # controller_frequency: 10.0  # Hz
+    # horizon_sec: 2.0            # seconds
+    # horizon_steps: 10           # prediction steps
     
-    # Command Velocity Message Type
-    use_stamped_cmd_vel: false   # true: TwistStamped, false: Twist
+    # # Command Velocity Message Type
+    # use_stamped_cmd_vel: false   # true: TwistStamped, false: Twist
     
     # Velocity Limits
     max_linear_vel: 0.5         # m/s
@@ -20,15 +20,15 @@ mpc_controller:
     min_lookahead_dist: 0.2     # meters
     max_lookahead_dist: 1.5     # meters
     
-    # Goal Tolerances
-    goal_dist_tolerance: 0.2    # meters
-    goal_theta_tolerance: 0.1   # radians
+    # # Goal Tolerances
+    # goal_dist_tolerance: 0.2    # meters
+    # goal_theta_tolerance: 0.1   # radians
     
     # Path Smoothing
     path_smoothing_window: 0.0  # meters - smooths sharp corners
 
     # Enable MPC Debugging Output
-    debug_mpc: false
+    # debug_mpc: true
     
     # MPC Cost Weights
     # State tracking weights [x, y, sin(theta), cos(theta)]
@@ -46,6 +46,6 @@ mpc_controller:
     R_d_matrix_diag: [50.0, 50.0]
     
     # Frame IDs
-    map_frame: "map"
-    base_frame: "base_link"
-    odom_frame: "odom"
+    # map_frame: "map"
+    # base_frame: "base_link"
+    # odom_frame: "odom"
