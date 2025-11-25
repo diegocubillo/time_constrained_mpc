@@ -1,6 +1,7 @@
 #include "time_constrained_mpc/time_constrained_mpc.hpp"
 #include <tf2/utils.h>
 #include <cmath>
+#include <algorithm>
 
 namespace mpc_controller
 {
@@ -283,6 +284,15 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
 {
   const auto goal = goal_handle->get_goal();
   auto original_path = goal->path;
+  
+  // Cancel previous goal if active
+  if (current_goal_handle_ && current_goal_handle_->is_active()) {
+    auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
+    current_goal_handle_->canceled(result);
+    RCLCPP_INFO(get_logger(), "Previous goal canceled");
+  }
+  
+  // Store new goal
   current_goal_handle_ = goal_handle;
   du_prev_ = Eigen::Vector2d::Zero();
   
@@ -296,6 +306,8 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   
   // Then smooth the interpolated path to handle sharp corners
   global_plan_ = smooth_path(interpolated_path, path_smoothing_window_);
+  
+  initial_rotation_completed_ = false;  // Reset rotation flag
   
   // Validate that all timestamps are in the future
   if (!global_plan_.poses.empty()) {
@@ -357,6 +369,78 @@ void MPCController::control_loop()
 
   // Calculate temporal error only for monitoring
   calculate_temporal_error(pose, current_time);
+
+  // ----- SIMPLE ANGLE CONTROL (Start Only) -----
+  // Check if we need to rotate in place before running MPC
+  if (!global_plan_.poses.empty() && !initial_rotation_completed_) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Rotating in place to align with path");
+    // Determine target orientation (first point of the plan)
+    double target_yaw = tf2::getYaw(global_plan_.poses.front().pose.orientation);
+    double current_yaw = tf2::getYaw(pose.pose.orientation);
+    double angle_error = target_yaw - current_yaw;
+
+    // Normalize angle error to [-pi, pi]
+    while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
+    while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
+
+      // If error is significant, rotate in place
+      if (std::abs(angle_error) > goal_theta_tolerance_) {
+        geometry_msgs::msg::Twist rotate_cmd;
+        rotate_cmd.linear.x = 0.0;
+        
+        // Constant velocity control for fast initial alignment
+        // Use 50% of max angular velocity in the direction of the error
+        double direction = (angle_error > 0) ? 1.0 : -1.0;
+        rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+        
+        publish_velocity_command(rotate_cmd);
+      
+      // Update feedback and return (skip MPC)
+      update_feedback(pose);
+      return;
+    } else {
+      // Angle is good, mark as completed and proceed to MPC
+      initial_rotation_completed_ = true;
+      RCLCPP_INFO(get_logger(), "Initial rotation completed. Switching to MPC.");
+    }
+  }
+
+  // ----- SIMPLE ANGLE CONTROL (End Only) -----
+  // Check if we are at the end and need to align orientation 
+  if (!global_plan_.poses.empty()) {
+    double dist_to_goal = std::hypot(
+      global_plan_.poses.back().pose.position.x - pose.pose.position.x,
+      global_plan_.poses.back().pose.position.y - pose.pose.position.y);
+
+    // Check if we are close to goal AND time has reached the end of the path
+    rclcpp::Time last_path_time(global_plan_.poses.back().header.stamp);
+    bool time_reached = current_time >= last_path_time;
+
+    if (dist_to_goal < goal_dist_tolerance_ && time_reached) {
+      double target_yaw = tf2::getYaw(global_plan_.poses.back().pose.orientation);
+      double current_yaw = tf2::getYaw(pose.pose.orientation);
+      double angle_error = target_yaw - current_yaw;
+
+      // Normalize angle error to [-pi, pi]
+      while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
+      while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
+
+      if (std::abs(angle_error) > goal_theta_tolerance_) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Rotating in place to align with goal");
+        
+        geometry_msgs::msg::Twist rotate_cmd;
+        rotate_cmd.linear.x = 0.0;
+        
+        // Constant velocity control
+        double direction = (angle_error > 0) ? 1.0 : -1.0;
+        rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+        
+        publish_velocity_command(rotate_cmd);
+        update_feedback(pose);
+        return;
+      }
+    }
+  }
   
   // Get reference trajectory for the MPC horizon based on current time
   auto reference_trajectory = get_reference_trajectory_horizon(current_time, horizon_steps_, d_t_);
@@ -795,7 +879,7 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
         "Temporal tracking: %.2f s behind schedule", std::abs(temporal_error));
     }
   }
-  RCLCPP_INFO(get_logger(),
+  RCLCPP_DEBUG(get_logger(),
     "Temporal error: %.3f s", temporal_error);
   
   return;
@@ -1081,7 +1165,12 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   double theta_error = std::abs(std::atan2(std::sin(goal_theta - current_theta), 
                                            std::cos(goal_theta - current_theta)));
   
-  return (dist < goal_dist_tolerance_) && (theta_error < goal_theta_tolerance_);
+  // Check time constraint
+  rclcpp::Time current_time = this->now();
+  rclcpp::Time last_path_time(goal.header.stamp);
+  bool time_reached = current_time >= last_path_time;
+  
+  return (dist < goal_dist_tolerance_) && (theta_error < goal_theta_tolerance_) && time_reached;
 }
 
 void MPCController::reset_state()
@@ -1095,6 +1184,7 @@ void MPCController::reset_state()
   global_plan_.poses.clear();
   du_prev_ = Eigen::Vector2d::Zero();
   current_goal_handle_.reset();
+  initial_rotation_completed_ = false;
   
   // Stop the robot
   geometry_msgs::msg::Twist stop_cmd;

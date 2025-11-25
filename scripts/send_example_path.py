@@ -171,8 +171,10 @@ class PathFollowerExample(Node):
             # Orientation tangent to the sine wave
             # For negative x progression: dx = -1.0
             dx = -1.0
-            dy = (amplitude * (2 * math.pi / wavelength) *
+            slope = (amplitude * (2 * math.pi / wavelength) *
                   math.cos(2 * math.pi * x / wavelength))
+            # The y-component of the tangent vector is slope * dx
+            dy = slope * dx
             yaw = math.atan2(dy, dx)
             pose.pose.orientation.z = math.sin(yaw / 2)
             pose.pose.orientation.w = math.cos(yaw / 2)

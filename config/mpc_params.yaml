@@ -22,7 +22,7 @@ mpc_controller:
     
     # # Goal Tolerances
     # goal_dist_tolerance: 0.2    # meters
-    # goal_theta_tolerance: 0.1   # radians
+    goal_theta_tolerance: 0.15   # radians (approx 8.6 degrees)
     
     # Path Smoothing
     path_smoothing_window: 0.0  # meters - smooths sharp corners
