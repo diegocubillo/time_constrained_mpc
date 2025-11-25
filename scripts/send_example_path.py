@@ -112,32 +112,65 @@ class PathFollowerExample(Node):
             self,
             amplitude=1.0,
             wavelength=2.0,
-            length=8.0,
-            num_points=40):
-        """Send a sine wave path to the controller"""
+            max_velocity=0.3,
+            point_spacing=0.1):
+        """
+        Send a sine wave path to the controller
+        
+        Args:
+            amplitude: Amplitude of the sine wave in meters
+            wavelength: Wavelength of the sine wave in meters
+            max_velocity: Maximum velocity in m/s for temporal constraints
+            point_spacing: Distance between consecutive points in meters
+        """
 
         # Wait for action server
         self.get_logger().info('Waiting for action server...')
         self._action_client.wait_for_server()
 
+        # Calculate length for 3 complete periods
+        length = 3.0 * wavelength
+        
+        # Calculate number of points based on spacing
+        num_points = int(length / point_spacing) + 1
+
         # Create path
         path = Path()
         path.header.frame_id = 'map'
-        path.header.stamp = self.get_clock().now().to_msg()
+        current_time = self.get_clock().now()
+        path.header.stamp = current_time.to_msg()
 
-        # Generate sine wave path
+        self.get_logger().info(
+            f'Generating sine wave: {num_points} points, '
+            f'{length:.2f}m length (3 periods)')
+
+        # Pre-calculate positions to compute arc length
+        positions = []
         for i in range(num_points):
-            x = length * i / (num_points - 1)
+            x = -point_spacing * i
             y = amplitude * math.sin(2 * math.pi * x / wavelength)
+            positions.append((x, y))
+
+        # Generate sine wave path (propagating towards negative x)
+        accumulated_time = 0.0
+        for i in range(num_points):
+            x, y = positions[i]
 
             pose = PoseStamped()
-            pose.header = path.header
+            pose.header.frame_id = 'map'
+            
+            # Calculate timestamp based on actual arc length and velocity
+            pose_time = current_time + rclpy.duration.Duration(
+                seconds=accumulated_time)
+            pose.header.stamp = pose_time.to_msg()
+            
             pose.pose.position.x = x
             pose.pose.position.y = y
             pose.pose.position.z = 0.0
 
             # Orientation tangent to the sine wave
-            dx = 1.0
+            # For negative x progression: dx = -1.0
+            dx = -1.0
             dy = (amplitude * (2 * math.pi / wavelength) *
                   math.cos(2 * math.pi * x / wavelength))
             yaw = math.atan2(dy, dx)
@@ -145,14 +178,29 @@ class PathFollowerExample(Node):
             pose.pose.orientation.w = math.cos(yaw / 2)
 
             path.poses.append(pose)
+            
+            # Calculate actual distance to next point for time increment
+            if i < num_points - 1:
+                x_next, y_next = positions[i + 1]
+                segment_length = math.sqrt(
+                    (x_next - x)**2 + (y_next - y)**2)
+                # Time increment based on actual segment length
+                accumulated_time += segment_length / max_velocity
+
+        # Calculate total path statistics
+        total_distance = (num_points - 1) * point_spacing
+        total_time = accumulated_time
+        avg_velocity = total_distance / total_time if total_time > 0 else 0.0
+
+        self.get_logger().info(
+            f'Sine wave path: {len(path.poses)} poses, '
+            f'Distance: {total_distance:.2f}m, '
+            f'Time: {total_time:.2f}s, '
+            f'Avg velocity: {avg_velocity:.2f}m/s')
 
         # Create goal
         goal_msg = FollowPath.Goal()
         goal_msg.path = path
-
-        self.get_logger().info(
-            f'Sending sine wave path with {len(path.poses)} poses'
-            )
 
         # Send goal
         self._send_goal_future = self._action_client.send_goal_async(
@@ -188,12 +236,12 @@ def main(args=None):
 
     # Choose which path to send:
     # node.send_circular_path(radius=2.0, num_points=20)
-    node.send_line_path(length=8.0, num_points=16, ms_increment=1500)
-    # node.send_sine_path(
-    #     amplitude=1.0,
-    #     wavelength=2.0,
-    #     length=8.0,
-    #     num_points=40)
+    # node.send_line_path(length=8.0, num_points=16, ms_increment=1500)
+    node.send_sine_path(
+        amplitude=1.0,
+        wavelength=2.0,
+        max_velocity=0.3,
+        point_spacing=0.1)
 
     try:
         rclpy.spin(node)

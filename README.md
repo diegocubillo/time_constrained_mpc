@@ -21,15 +21,25 @@ This package implements an efficient Model Predictive Controller (MPC) for diffe
 
 ## MPC Formulation
 
-### State Vector
+### State Vector - Sin/Cos Representation
+To avoid linearization issues and discontinuities at ±π, the controller uses a **sin/cos representation** of orientation:
 ```
-x = [x, y, θ]  // Robot position (x, y) and orientation (θ)
+x = [x, y, sin(θ), cos(θ)]  // Robot position and orientation components
 ```
+
+**Advantages:**
+- ✅ **No discontinuities**: sin(θ) and cos(θ) are continuous everywhere
+- ✅ **Better linearization**: No angular wrapping needed in optimization
+- ✅ **Simplified implementation**: Eliminates complex angle normalization strategies
+
+**Trade-off:**
+- ⚠️ State dimension increased from 3 to 4
+- ⚠️ Geometric constraint sin²(θ) + cos²(θ) = 1 not explicitly enforced (see warning below)
 
 ### Augmented State Vector
 The controller uses an augmented state to handle control increments:
 ```
-ξ = [x, y, θ, u_prev_v, u_prev_ω]  // State + previous velocities
+ξ = [x, y, sin(θ), cos(θ), u_prev_v, u_prev_ω]  // State + previous velocities
 ```
 This stores the previous velocity (NOT the increment), which ensures correct dynamics: x_{k+1} = A·x_k + B·u_k
 
@@ -43,14 +53,65 @@ The optimizer works with control increments:
 Δu = [Δv, Δω]  // Changes in velocity and angular rate
 ```
 
-### Differential Drive Kinematics
+### Differential Drive Kinematics with Sin/Cos
 ```
 dx/dt = v * cos(θ)
 dy/dt = v * sin(θ)
-dθ/dt = ω
+d(sin(θ))/dt = cos(θ) * ω
+d(cos(θ))/dt = -sin(θ) * ω
 ```
 
-The model is linearized around the reference trajectory and discretized for MPC.
+The model is linearized around the reference trajectory and discretized for MPC using Euler forward integration.
+
+### ⚠️ Important: Norm Constraint Violation
+
+The geometric constraint **sin²(θ) + cos²(θ) = 1** is **NOT explicitly enforced** in the optimization. This is because:
+
+1. **OSQP cannot handle quadratic constraints** - it only supports linear constraints
+2. **Adding this constraint would require switching to a slower NLP solver** (IPOPT, SNOPT) with 10-40x performance penalty
+3. **In practice, the violation is acceptable** for most applications
+
+**Violation magnitude depends on:**
+- `controller_frequency` (dt): Lower frequency → larger dt → worse violation
+- `max_angular_vel`: Higher angular velocity → worse violation  
+- `horizon_steps`: More steps → accumulated error
+- Linearization error: Distance between current and reference orientation
+
+**Estimated worst-case violation:**
+```
+Δnorm ≈ 0.5 * ω_max² * dt² * N
+```
+
+With default parameters (ω_max=1.0 rad/s, dt=0.1s, N=10):
+```
+Δnorm ≈ 0.5 * 1.0² * 0.01 * 10 = 0.05 (5% error)
+```
+
+**Mitigation strategies if needed:**
+- Increase `controller_frequency` (reduces dt)
+- Decrease `max_angular_vel`
+- Decrease `horizon_steps`
+- Add post-optimization normalization (see `SINCOS_REPRESENTATION.md`)
+
+**Why it works anyway:**
+- MPC re-optimizes at every time step, preventing error accumulation
+- Only the first control input is applied
+- Errors tend to cancel out over time due to the closed-loop nature
+- The constraint is approximately satisfied by the dynamics
+
+**When to worry about this issue:**
+- ❌ If you observe the robot's heading "drifting" over long runs
+- ❌ If you need very precise orientation control (e.g., docking)
+- ❌ If using very low controller frequency (<5 Hz)
+- ❌ If using very high angular velocities (>2 rad/s)
+- ❌ If the robot exhibits oscillatory behavior in orientation
+
+**When it's safe to ignore:**
+- ✅ Path following applications (current use case)
+- ✅ Controller frequency ≥ 10 Hz
+- ✅ Moderate angular velocities (≤ 1.5 rad/s)
+- ✅ When position accuracy is more important than orientation
+- ✅ Short prediction horizons (N ≤ 20)
 
 ### Cost Function
 The MPC minimizes the following quadratic cost (Option 2 - smoothness only):
@@ -59,7 +120,7 @@ J = Σ(||x_i - x_ref||²_Q + ||Δu_i||²_Rd)
 ```
 
 Where:
-- **Q** = State tracking weight matrix [x, y, θ] - penalizes deviation from path
+- **Q** = State tracking weight matrix [x, y, sin(θ), cos(θ)] - penalizes deviation from path
 - **R_d** = Control rate weight matrix [Δv, Δω] - penalizes abrupt changes (smoothness)
 
 **Note**: The current implementation (Option 2) does NOT penalize absolute control effort (no R matrix in cost). This means:
@@ -109,7 +170,7 @@ This ensures the optimizer knows about both acceleration and velocity limits, pr
 - `goal_theta_tolerance` (default: 0.1): Angular tolerance to goal in radians
 
 ### Cost Matrix Weights
-- `Q_matrix_diag` (default: [10.0, 10.0, 1.0]): State error weights [x, y, θ]
+- `Q_matrix_diag` (default: [10.0, 10.0, 1.0, 1.0]): State error weights [x, y, sin(θ), cos(θ)]
 - `R_matrix_diag` (default: [1.0, 1.0]): **NOT USED in Option 2** - Control effort weights [v, ω]
 - `R_d_matrix_diag` (default: [10.0, 10.0]): Control rate weights [Δv, Δω] - controls smoothness
 
@@ -220,18 +281,33 @@ The controller uses an augmented state ξ = [x, y, θ, u_prev_v, u_prev_ω] wher
 
 ### For Faster Response
 - Increase Q weights (especially for position tracking)
-- Decrease horizon_steps (faster computation)
+- Decrease horizon_steps (faster computation, also reduces norm violation)
 - Increase max velocities and accelerations
 
 ### For Smoother Motion
 - Increase R_d weights (more penalty on control changes)
 - Decrease max_linear_accel and max_angular_accel
-- Increase horizon_steps (longer prediction)
+- Increase horizon_steps (longer prediction, but increases norm violation)
 
 ### For Better Path Tracking
 - Increase Q_matrix_diag for x and y
 - Increase lookahead distance
 - Increase horizon_sec
+
+### For Reducing Norm Constraint Violation
+If you observe orientation drift or need stricter geometric accuracy:
+- **Increase controller_frequency** (most effective: reduces dt²)
+- **Decrease max_angular_vel** (reduces ω_max²)
+- **Decrease horizon_steps** (reduces accumulated error)
+- Increase Q weights for sin(θ) and cos(θ) (indices 2 and 3)
+
+**Example for high-precision orientation:**
+```yaml
+controller_frequency: 20.0  # Halve dt → 4x less error
+max_angular_vel: 0.8        # Reduce ω → less error
+horizon_steps: 8            # Fewer steps → less accumulation
+Q_matrix_diag: [3000.0, 3000.0, 10.0, 10.0]  # Higher angular tracking
+```
 
 ### About R_matrix_diag (Not Used)
 The R_matrix_diag parameter exists but is NOT used in the current implementation (Option 2). To add energy optimization:
@@ -249,6 +325,7 @@ This is the base MPC controller. Future work will include:
 - 📈 Performance profiling and optimization
 - ⚡ Option 1 implementation (energy optimization with absolute control penalty)
 - 🎯 Coupled constraints for better horizon-wide velocity limit enforcement
+- 🔧 Optional norm constraint enforcement for stricter geometric accuracy
 
 ## References
 

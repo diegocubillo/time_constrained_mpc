@@ -24,9 +24,19 @@ Visualization Manager:
       Color: 255; 0; 0
     - Class: rviz_default_plugins/Path
       Enabled: true
-      Name: MPC Debug Path
-      Topic: /mpc_debug_path
+      Name: MPC Global Path
+      Topic: /mpc_global_path
       Color: 0; 255; 0
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: MPC Predicted Path
+      Topic: /mpc_predicted_path
+      Color: 255; 0; 255
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Robot Pose
+      Topic: /mpc_debug_pose
+      Color: 0; 0; 255
   Global Options:
     Fixed Frame: map
   Views:

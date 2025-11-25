@@ -54,6 +54,7 @@ install(TARGETS time_constrained_mpc
 # Install Python scripts
 install(PROGRAMS
   scripts/send_example_path.py
+  scripts/send_maze_path.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Install launch files
