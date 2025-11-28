@@ -12,7 +12,6 @@ This package implements an efficient Model Predictive Controller (MPC) for diffe
 ## Features
 
 - ✅ Efficient MPC formulation optimized for differential drive kinematics
-- ✅ Lookahead point calculation with adaptive lookahead distance based on velocity
 - ✅ State-space formulation with augmented states for control rate penalization
 - ✅ Box constraints on control inputs (velocity and angular rate)
 - ✅ TF2 integration for robot localization
@@ -150,7 +149,6 @@ This ensures the optimizer knows about both acceleration and velocity limits, pr
 ## Parameters
 
 ### MPC Parameters
-- `horizon_sec` (default: 2.0): Prediction horizon in seconds
 - `horizon_steps` (default: 10): Number of prediction steps
 - `controller_frequency` (default: 10.0): Control loop frequency in Hz
 
@@ -160,24 +158,18 @@ This ensures the optimizer knows about both acceleration and velocity limits, pr
 - `max_linear_accel` (default: 0.2): Maximum linear acceleration in m/s²
 - `max_angular_accel` (default: 0.3): Maximum angular acceleration in rad/s²
 
-### Lookahead Parameters
-- `lookahead_time` (default: 1.5): Lookahead time multiplier in seconds
-- `min_lookahead_dist` (default: 0.3): Minimum lookahead distance in meters
-- `max_lookahead_dist` (default: 0.9): Maximum lookahead distance in meters
-
 ### Goal Tolerances
 - `goal_dist_tolerance` (default: 0.2): Distance tolerance to goal in meters
 - `goal_theta_tolerance` (default: 0.1): Angular tolerance to goal in radians
 
 ### Cost Matrix Weights
 - `Q_matrix_diag` (default: [10.0, 10.0, 1.0, 1.0]): State error weights [x, y, sin(θ), cos(θ)]
-- `R_matrix_diag` (default: [1.0, 1.0]): **NOT USED in Option 2** - Control effort weights [v, ω]
 - `R_d_matrix_diag` (default: [10.0, 10.0]): Control rate weights [Δv, Δω] - controls smoothness
 
 ### Frame IDs
 - `map_frame` (default: "map"): Global reference frame
 - `base_frame` (default: "base_link"): Robot base frame
-- `odom_frame` (default: "odom"): Odometry frame
+- `odom_topic` (default: "odom"): Odometry topic name
 
 ## Dependencies
 
@@ -291,8 +283,7 @@ The controller uses an augmented state ξ = [x, y, θ, u_prev_v, u_prev_ω] wher
 
 ### For Better Path Tracking
 - Increase Q_matrix_diag for x and y
-- Increase lookahead distance
-- Increase horizon_sec
+- Increase horizon_steps
 
 ### For Reducing Norm Constraint Violation
 If you observe orientation drift or need stricter geometric accuracy:
@@ -309,21 +300,14 @@ horizon_steps: 8            # Fewer steps → less accumulation
 Q_matrix_diag: [3000.0, 3000.0, 10.0, 10.0]  # Higher angular tracking
 ```
 
-### About R_matrix_diag (Not Used)
-The R_matrix_diag parameter exists but is NOT used in the current implementation (Option 2). To add energy optimization:
-- Would require implementing Option 1 with cumulative control matrix
-- Would penalize maintaining high velocities (energy-efficient movements)
-- Current implementation prioritizes simplicity and smoothness over energy optimization
 
 ## Future Enhancements
 
 This is the base MPC controller. Future work will include:
-- ⏱️ Time constraints for waypoint arrival times
 - 🚧 Obstacle avoidance integration
 - 📊 Cost-to-go estimation for better terminal cost
 - 🔄 Adaptive horizon based on path curvature
 - 📈 Performance profiling and optimization
-- ⚡ Option 1 implementation (energy optimization with absolute control penalty)
 - 🎯 Coupled constraints for better horizon-wide velocity limit enforcement
 - 🔧 Optional norm constraint enforcement for stricter geometric accuracy
 

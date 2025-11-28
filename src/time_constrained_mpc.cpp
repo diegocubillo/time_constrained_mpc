@@ -45,12 +45,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   max_angular_vel_ = this->declare_parameter<double>("max_angular_vel", 1.0);
   max_linear_accel_ = this->declare_parameter<double>("max_linear_accel", 0.2);
   max_angular_accel_ = this->declare_parameter<double>("max_angular_accel", 0.3);
-  horizon_sec_ = this->declare_parameter<double>("horizon_sec", 2.0);
   horizon_steps_ = this->declare_parameter<int>("horizon_steps", 10);
   
-  lookahead_time_ = this->declare_parameter<double>("lookahead_time", 1.5);
-  min_lookahead_dist_ = this->declare_parameter<double>("min_lookahead_dist", 0.3);
-  max_lookahead_dist_ = this->declare_parameter<double>("max_lookahead_dist", 0.9);
   goal_dist_tolerance_ = this->declare_parameter<double>("goal_dist_tolerance", 0.2);
   goal_theta_tolerance_ = this->declare_parameter<double>("goal_theta_tolerance", 0.1);
   path_smoothing_window_ = this->declare_parameter<double>("path_smoothing_window", 0.5);
@@ -58,7 +54,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   // Frame IDs
   map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
   base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
-  odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
+  std::string odom_topic = this->declare_parameter<std::string>("odom_topic", "odom");
   
   // Create bond
   create_bond();
@@ -67,23 +63,19 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   double controller_frequency = this->declare_parameter<double>("controller_frequency", 10.0);
   d_t_ = 1.0 / controller_frequency;
   
-  // MPC weight matrices Q[x, y, s_theta, c_theta], R[v, w], R_d[dv, dw]
+  // MPC weight matrices Q[x, y, s_theta, c_theta], R_d[dv, dw]
   std::vector<double> q_diag = this->declare_parameter<std::vector<double>>(
     "Q_matrix_diag", {10.0, 10.0, 1.0, 1.0});
-  std::vector<double> r_diag = this->declare_parameter<std::vector<double>>(
-    "R_matrix_diag", {1.0, 1.0});
   std::vector<double> rd_diag = this->declare_parameter<std::vector<double>>(
     "R_d_matrix_diag", {10.0, 10.0});
   
   Q_ = Eigen::Matrix4d::Zero();
-  R_ = Eigen::Matrix2d::Zero();
   R_d_ = Eigen::Matrix2d::Zero();
   
   for (size_t i = 0; i < 4; ++i) {
     Q_(i, i) = q_diag[i];
   }
   for (size_t i = 0; i < 2; ++i) {
-    R_(i, i) = r_diag[i];
     R_d_(i, i) = rd_diag[i];
   }
   
@@ -93,7 +85,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   
   // Odometry subscriber
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "odom", 10,
+    odom_topic, 10,
     [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
       current_odom_ = *msg;
       has_odom_ = true;
@@ -130,21 +122,20 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   // Note: initialized_ will be set to true in on_activate()
   initialized_ = false;
 
+  // Calculate horizon seconds (just for the logger)
+  double horizon_sec = horizon_steps_ * d_t_;
+
   // Log all configuration parameters
   RCLCPP_INFO(get_logger(), "MPCController on_configure() is called.");
   RCLCPP_INFO(get_logger(), "=== MPC Configuration Parameters ===");
   RCLCPP_INFO(get_logger(), "Controller frequency: %.1f Hz", 1.0 / d_t_);
-  RCLCPP_INFO(get_logger(), "Horizon: %.2f sec (%d steps)", horizon_sec_, horizon_steps_);
+  RCLCPP_INFO(get_logger(), "Horizon: %d steps (%.2f sec)", horizon_steps_, horizon_sec);
   RCLCPP_INFO(get_logger(), "Control time step: %.3f sec", d_t_);
   RCLCPP_INFO(get_logger(), "=== Velocity Limits ===");
   RCLCPP_INFO(get_logger(), "Max linear velocity: %.2f m/s", max_linear_vel_);
   RCLCPP_INFO(get_logger(), "Max angular velocity: %.2f rad/s", max_angular_vel_);
   RCLCPP_INFO(get_logger(), "Max linear acceleration: %.2f m/s²", max_linear_accel_);
   RCLCPP_INFO(get_logger(), "Max angular acceleration: %.2f rad/s²", max_angular_accel_);
-  RCLCPP_INFO(get_logger(), "=== Lookahead Configuration ===");
-  RCLCPP_INFO(get_logger(), "Lookahead time: %.2f sec", lookahead_time_);
-  RCLCPP_INFO(get_logger(), "Min lookahead distance: %.2f m", min_lookahead_dist_);
-  RCLCPP_INFO(get_logger(), "Max lookahead distance: %.2f m", max_lookahead_dist_);
   RCLCPP_INFO(get_logger(), "=== Goal Tolerances ===");
   RCLCPP_INFO(get_logger(), "Distance tolerance: %.2f m", goal_dist_tolerance_);
   RCLCPP_INFO(get_logger(), "Theta tolerance: %.2f rad", goal_theta_tolerance_);
@@ -153,14 +144,12 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   RCLCPP_INFO(get_logger(), "=== MPC Cost Weights ===");
   RCLCPP_INFO(get_logger(), "Q (state tracking) [x, y, sin(θ), cos(θ)]: [%.1f, %.1f, %.1f, %.1f]",
               Q_(0, 0), Q_(1, 1), Q_(2, 2), Q_(3, 3));
-  RCLCPP_INFO(get_logger(), "R (control effort) [v, ω]: [%.1f, %.1f]",
-              R_(0, 0), R_(1, 1));
   RCLCPP_INFO(get_logger(), "R_d (control rate) [Δv, Δω]: [%.1f, %.1f]",
               R_d_(0, 0), R_d_(1, 1));
   RCLCPP_INFO(get_logger(), "=== Frame IDs ===");
   RCLCPP_INFO(get_logger(), "Map frame: %s", map_frame_.c_str());
   RCLCPP_INFO(get_logger(), "Base frame: %s", base_frame_.c_str());
-  RCLCPP_INFO(get_logger(), "Odom frame: %s", odom_frame_.c_str());
+  RCLCPP_INFO(get_logger(), "Odom topic: %s", odom_topic.c_str());
   RCLCPP_INFO(get_logger(), "====================================");
   
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -497,69 +486,6 @@ geometry_msgs::msg::Twist MPCController::get_robot_velocity()
   }
   // TODO add fallback using tf if no odom received
   return vel;
-}
-
-// ----- PATH PROCESSING -----
-geometry_msgs::msg::PoseStamped MPCController::calculate_lookahead_point()
-{
-  geometry_msgs::msg::PoseStamped lookahead;
-  
-  if (global_plan_.poses.empty()) {
-    return lookahead;
-  }
-  
-  auto robot_pose = get_robot_pose();
-  auto velocity = get_robot_velocity();
-  
-  // Calculate lookahead distance based on velocity
-  double vt = std::hypot(velocity.linear.x, velocity.linear.y);
-  double lookahead_dist = std::clamp(
-    vt * lookahead_time_,
-    min_lookahead_dist_,
-    max_lookahead_dist_
-  );
-  
-  // Find the closest point on the path to the robot
-  double min_dist = std::numeric_limits<double>::max();
-  size_t closest_idx = 0;
-  
-  for (size_t i = 0; i < global_plan_.poses.size(); ++i) {
-    double dx = global_plan_.poses[i].pose.position.x - robot_pose.pose.position.x;
-    double dy = global_plan_.poses[i].pose.position.y - robot_pose.pose.position.y;
-    double dist = std::hypot(dx, dy);
-    
-    if (dist < min_dist) {
-      min_dist = dist;
-      closest_idx = i;
-    }
-  }
-  
-  // Find the lookahead point on the path
-  double accumulated_dist = 0.0;
-  for (size_t i = closest_idx; i < global_plan_.poses.size() - 1; ++i) {
-    double dx = global_plan_.poses[i + 1].pose.position.x - global_plan_.poses[i].pose.position.x;
-    double dy = global_plan_.poses[i + 1].pose.position.y - global_plan_.poses[i].pose.position.y;
-    double segment_dist = std::hypot(dx, dy);
-    
-    if (accumulated_dist + segment_dist >= lookahead_dist) {
-      // Interpolate between points i and i+1
-      double ratio = (lookahead_dist - accumulated_dist) / segment_dist;
-      lookahead.pose.position.x = global_plan_.poses[i].pose.position.x + ratio * dx;
-      lookahead.pose.position.y = global_plan_.poses[i].pose.position.y + ratio * dy;
-      lookahead.pose.orientation = global_plan_.poses[i + 1].pose.orientation;
-      lookahead.header = global_plan_.header;
-      return lookahead;
-    }
-    
-    accumulated_dist += segment_dist;
-  }
-  
-  // If we didn't find a point, return the last point
-  if (!global_plan_.poses.empty()) {
-    lookahead = global_plan_.poses.back();
-  }
-  
-  return lookahead;
 }
 
 // ----- PATH INTERPOLATION -----

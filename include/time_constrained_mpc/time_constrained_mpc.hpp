@@ -58,7 +58,6 @@ public:
   geometry_msgs::msg::Twist get_robot_velocity();
 
   // Path processing
-  geometry_msgs::msg::PoseStamped calculate_lookahead_point();
   nav_msgs::msg::Path interpolate_path(const nav_msgs::msg::Path &original_path,
                                         double target_spacing = 0.1);
   nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path &original_path,
@@ -141,12 +140,9 @@ private:
   double max_angular_vel_;
   double max_linear_accel_;   // Maximum linear acceleration (Δv per time step)
   double max_angular_accel_;  // Maximum angular acceleration (Δω per time step)
-  double horizon_sec_;
   int horizon_steps_;
   double d_t_;  // Control time step
-  double lookahead_time_;
-  double min_lookahead_dist_;
-  double max_lookahead_dist_;
+
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
   bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
@@ -155,13 +151,11 @@ private:
   
   // MPC weight matrices
   Eigen::Matrix4d Q_;  // State error weight [x, y, s_theta, c_theta]
-  Eigen::Matrix2d R_;  // Control weight
   Eigen::Matrix2d R_d_;  // Control rate weight
   
   // Frame IDs
   std::string map_frame_;
   std::string base_frame_;
-  std::string odom_frame_;
 };
 
 }  // namespace mpc_controller

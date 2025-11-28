@@ -11,7 +11,6 @@
 | $N$ | - | Número de pasos del horizonte de predicción (ej: 10) |
 | $\Delta t$ | - | Paso de tiempo del control (ej: 0.1s) |
 | $Q$ | 3×3 | Matriz de peso para el error de estado (penaliza desviaciones de posición/orientación) |
-| $R$ | 2×2 | **NO USADO en Opción 2** - Matriz de peso para el control (penaliza uso de energía) |
 | $R_d$ | 2×2 | Matriz de peso para cambios de control (penaliza aceleraciones bruscas/suavidad) |
 | $A_d$ | 3×3 | Matriz de transición de estados discretizada |
 | $B_d$ | 3×2 | Matriz de entrada de control discretizada |
@@ -26,13 +25,13 @@
 | $\bar{R}_d$ | 2N×2N | Matriz de peso de incrementos de control extendida para todo el horizonte (solo $R_d$, no $R$) |
 | $v_{ref}$ | - | Velocidad lineal de referencia (obtenida de la odometría actual del robot) |
 | $\omega_{ref}$ | - | Velocidad angular de referencia (obtenida de la odometría actual del robot) |
-| $\theta_{ref}$ | - | Orientación de referencia (obtenida del lookahead point en la trayectoria) |
+| $\theta_{ref}$ | - | Orientación de referencia (obtenida de la trayectoria) |
 
 ### Nota importante sobre referencias y incrementos:
 
 - **$v_{ref}$ y $\omega_{ref}$**: Son las velocidades actuales del robot obtenidas de la odometría (`current_odom_.twist.twist`). Se usan para linealizar el modelo dinámico alrededor del punto de operación actual.
 
-- **$\theta_{ref}$**: Es la orientación del punto de lookahead en la trayectoria deseada (`desired_state(2)`). Se usa para linealizar las ecuaciones cinemáticas del robot.
+- **$\theta_{ref}$**: Es la orientación en la trayectoria deseada (`desired_state(2)`). Se usa para linealizar las ecuaciones cinemáticas del robot.
 
 - **$\Delta u_i$**: Son incrementos **respecto al control anterior**. Es decir:
   - $\Delta u_0 = u_0 - u_{-1}$ (control actual menos control del ciclo anterior)
@@ -65,7 +64,6 @@ $$
 **Nota**: La implementación actual usa **Opción 2** (solo penaliza incrementos), donde:
 - $\|x_i - x_{ref}\|_Q^2$: Penaliza la desviación del estado respecto a la referencia
 - $\|\Delta u_i\|_{R_d}^2$: Penaliza cambios bruscos en el control (suavidad)
-- **NO se penaliza** $\|u_i - u_{ref}\|_R^2$ (esfuerzo de control absoluto)
 
 Esto significa que el robot busca movimientos suaves pero puede mantener velocidades altas constantes sin penalización.
 
