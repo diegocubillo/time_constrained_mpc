@@ -1,5 +1,6 @@
 #pragma once
 
+#include "time_constrained_mpc/mpc_logger.hpp"
 #include <memory>
 #include <vector>
 #include <string>
@@ -156,6 +157,10 @@ private:
   // Frame IDs
   std::string map_frame_;
   std::string base_frame_;
+
+  // Logger
+  std::unique_ptr<MPCLogger> mpc_logger_;
+  std::vector<Eigen::Vector4d> last_predicted_states_;
 };
 
 }  // namespace mpc_controller

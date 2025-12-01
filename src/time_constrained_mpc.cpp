@@ -11,6 +11,9 @@ MPCController::MPCController()
 {
   // Initialize bond ID to match what Nav2 lifecycle manager expects
   bond_id_ = get_name();
+  
+  // Initialize logger
+  mpc_logger_ = std::make_unique<MPCLogger>();
 }
 
 MPCController::~MPCController() = default;
@@ -190,6 +193,21 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
   // Enable the controller - now it can accept goals
   initialized_ = true;
 
+  // Open log file
+  auto now = std::chrono::system_clock::now();
+  auto in_time_t = std::chrono::system_clock::to_time_t(now);
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
+  std::string home_dir = std::getenv("HOME");
+  std::string log_file = home_dir + "/.ros/log/mpc_data_" + ss.str() + ".csv";
+  
+  if (mpc_logger_->open(log_file)) {
+    RCLCPP_INFO(get_logger(), "MPC Logging started: %s", log_file.c_str());
+    mpc_logger_->write_header(horizon_steps_);
+  } else {
+    RCLCPP_ERROR(get_logger(), "Failed to open MPC log file: %s", log_file.c_str());
+  }
+
   RCLCPP_INFO(get_logger(), "MPCController on_activate() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
@@ -225,6 +243,10 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   
   // Stop the robot
   reset_state();
+
+  // Close log file
+  mpc_logger_->close();
+  RCLCPP_INFO(get_logger(), "MPC Logging stopped");
 
   RCLCPP_INFO(get_logger(), "MPCController on_deactivate() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -439,6 +461,25 @@ void MPCController::control_loop()
 
   // Publish command
   publish_velocity_command(cmd);
+
+  // Log data
+  if (initialized_ && !global_plan_.poses.empty()) {
+    auto ref_pose = get_temporal_reference(current_time);
+    
+    // Calculate spatial error to reference
+    double dx = ref_pose.pose.position.x - pose.pose.position.x;
+    double dy = ref_pose.pose.position.y - pose.pose.position.y;
+    double spatial_error = std::hypot(dx, dy);
+    
+    mpc_logger_->log(
+      current_time.seconds(),
+      pose,
+      ref_pose,
+      spatial_error,
+      cmd,
+      last_predicted_states_
+    );
+  }
 
   // Publish debug path (optional)
   path_pub_->publish(global_plan_);
@@ -1002,6 +1043,57 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
         predicted_path_pub_->publish(predicted_path);
       }
       
+      // Store predicted states for logging (always, even if debug is off)
+      last_predicted_states_.clear();
+      // Re-calculate prediction for logging if debug was off, or just use the loop above?
+      // To avoid code duplication and overhead, let's just do the prediction loop once.
+      // We will refactor the prediction loop to populate last_predicted_states_
+      
+      // Reset state for prediction
+      double x_pred = current_state(0);
+      double y_pred = current_state(1);
+      double s_theta_pred = current_state(2);
+      double c_theta_pred = current_state(3);
+      double v_pred = u_ref(0) + du_prev_(0); // Reset to initial condition
+      double w_pred = u_ref(1) + du_prev_(1);
+      
+      // Note: du_prev_ was already updated with delta_v/w above, so we need to be careful.
+      // Actually, du_prev_ is updated at lines 945-946.
+      // The prediction loop at 966 uses work->solution->x which are DELTAS.
+      // So we need to start from the state BEFORE the current update? 
+      // No, the prediction starts from current_state.
+      // The controls applied are u_0, u_1...
+      // u_0 = u_ref + du_prev_old + delta_u_0
+      // But du_prev_ is now u_ref + du_prev_old + delta_u_0 - u_ref = du_prev_new
+      // Wait, let's look at 945: du_prev_(0) += delta_v;
+      // So du_prev_ now contains the accumulated control for step 0.
+      
+      // Let's just reconstruct the states for logging.
+      // We need to subtract the current delta to get back to "previous" for the loop?
+      // Or just use the loop logic correctly.
+      
+      // Re-initialize for logging loop
+      v_pred = u_ref(0) + du_prev_(0) - delta_v; // Back to u_{-1}
+      w_pred = u_ref(1) + du_prev_(1) - delta_w;
+      
+      last_predicted_states_.reserve(horizon_steps_);
+      
+      for (int i = 0; i < horizon_steps_; ++i) {
+         // Update velocity
+         v_pred += work->solution->x[2*i];
+         w_pred += work->solution->x[2*i + 1];
+         
+         // Integrate
+         x_pred += v_pred * c_theta_pred * d_t_;
+         y_pred += v_pred * s_theta_pred * d_t_;
+         s_theta_pred += c_theta_pred * w_pred * d_t_;
+         c_theta_pred += -s_theta_pred * w_pred * d_t_;
+         
+         Eigen::Vector4d state;
+         state << x_pred, y_pred, s_theta_pred, c_theta_pred;
+         last_predicted_states_.push_back(state);
+      }
+      
       // Saturate controls as safety measure
       // (Should not be necessary if constraints are properly set, but kept as failsafe)
       cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
@@ -1064,9 +1156,12 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
   
   auto feedback = std::make_shared<nav2_msgs::action::FollowPath::Feedback>();
   feedback->speed = get_robot_velocity().linear.x;
-  feedback->distance_to_goal = std::hypot(
-    global_plan_.poses.back().pose.position.x - pose.pose.position.x,
-    global_plan_.poses.back().pose.position.y - pose.pose.position.y);
+  
+  // Calculate distance to temporal reference instead of final goal
+  auto ref_pose = get_temporal_reference(this->now());
+  double dx = ref_pose.pose.position.x - pose.pose.position.x;
+  double dy = ref_pose.pose.position.y - pose.pose.position.y;
+  feedback->distance_to_goal = std::hypot(dx, dy);
   
   current_goal_handle_->publish_feedback(feedback);
 }
@@ -1318,15 +1413,19 @@ void MPCController::build_mpc_matrices(
     double delta_v_min = std::max(-max_linear_accel_, 0.0 - v_current);
     double delta_v_max = std::min(max_linear_accel_, max_linear_vel_ - v_current);
     
-    l(dim_u * i) = delta_v_min;
-    u(dim_u * i) = delta_v_max;
-    
     // Angular velocity constraints (Δω)
     // We want: -ω_max <= w_current + Δω_i <= ω_max
     // Therefore: -ω_max - w_current <= Δω_i <= ω_max - w_current
     // But also: -max_angular_accel_ <= Δω_i <= max_angular_accel_ (angular acceleration limits)
     double delta_w_min = std::max(-max_angular_accel_, -max_angular_vel_ - w_current);
     double delta_w_max = std::min(max_angular_accel_, max_angular_vel_ - w_current);
+    
+    // Ensure bounds are valid (l <= u)
+    if (delta_v_min > delta_v_max) delta_v_min = delta_v_max;
+    if (delta_w_min > delta_w_max) delta_w_min = delta_w_max;
+    
+    l(dim_u * i) = delta_v_min;
+    u(dim_u * i) = delta_v_max;
     
     l(dim_u * i + 1) = delta_w_min;
     u(dim_u * i + 1) = delta_w_max;
