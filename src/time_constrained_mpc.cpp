@@ -571,6 +571,12 @@ nav_msgs::msg::Path MPCController::smooth_path(const nav_msgs::msg::Path &origin
   nav_msgs::msg::Path smoothed_path;
   smoothed_path.header = original_path.header;
   
+  // Special case: no smoothing requested
+  if (smoothing_window == 0.0) {
+    RCLCPP_INFO(get_logger(), "Path smoothing disabled (window = 0.0m)");
+    return original_path;
+  }
+  
   if (original_path.poses.size() < 3) {
     // Not enough points to smooth, return original
     return original_path;
