@@ -121,7 +121,7 @@ def generate_launch_description():
         'geometry_msgs/msg/PoseWithCovarianceStamped',
         '"{header: {frame_id: "map"}, '
         'pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, '
-        'orientation: {x: 0.0, y: 0.0, z: 1.0, w: 0.0}}}}"'
+        'orientation: {x: 0.0, y: 0.0, z: -0.8169106, w: 0.5767644}}}}"'
     ]
     publish_initial_pose = TimerAction(
         period=2.0,
