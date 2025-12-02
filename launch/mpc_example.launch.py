@@ -30,7 +30,7 @@ def generate_launch_description():
     example_params_file = os.path.join(
         pkg_dir, 'config', 'example_params.yaml')
     mpc_params_file = os.path.join(pkg_dir, 'config', 'mpc_params.yaml')
-    map_file = os.path.join(pkg_dir, 'maps', 'map.yaml')
+    # map_file = os.path.join(pkg_dir, 'maps', 'map.yaml')
     rviz_config_file = os.path.join(pkg_dir, 'config', 'example_view.rviz')
 
     # Launch arguments
@@ -53,26 +53,31 @@ def generate_launch_description():
         default_value='true',
         description='Whether to start RViz2')
 
+    declare_params_file_cmd = DeclareLaunchArgument(
+        'params_file',
+        default_value=mpc_params_file,
+        description='Full path to the ROS2 parameters file to use for all launched nodes')
+
     # Configure yaml parameters
     configured_params = RewrittenYaml(
         source_file=example_params_file,
         root_key='',
         param_rewrites={
-            'yaml_filename': map_file,
+            # 'yaml_filename': map_file,
             'use_sim_time': use_sim_time,
             'autostart': autostart,
         },
         convert_types=True
     )
 
-    # Map server
-    map_server_node = LifecycleNode(
-        package='nav2_map_server',
-        executable='map_server',
-        name='map_server',
-        namespace='',
-        output='screen',
-        parameters=[configured_params])
+    # # Map server
+    # map_server_node = LifecycleNode(
+    #     package='nav2_map_server',
+    #     executable='map_server',
+    #     name='map_server',
+    #     namespace='',
+    #     output='screen',
+    #     parameters=[configured_params, {'yaml_filename': map_file}])
 
     # Our MPC Controller
     mpc_controller_node = LifecycleNode(
@@ -81,7 +86,7 @@ def generate_launch_description():
         name='mpc_controller',
         namespace='',
         output='screen',
-        parameters=[mpc_params_file, {'use_sim_time': use_sim_time}],
+        parameters=[LaunchConfiguration('params_file'), {'use_sim_time': use_sim_time}],
         emulate_tty=True)
 
     # Lifecycle manager - manages all lifecycle nodes
@@ -116,7 +121,7 @@ def generate_launch_description():
         'geometry_msgs/msg/PoseWithCovarianceStamped',
         '"{header: {frame_id: "map"}, '
         'pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, '
-        'orientation: {x: 0.0, y: 0.0, z: 1.0, w: 0.0}}}}"'
+        'orientation: {x: 0.0, y: 0.0, z: -0.8169106, w: 0.5767644}}}}"'
     ]
     publish_initial_pose = TimerAction(
         period=2.0,
@@ -154,9 +159,20 @@ def generate_launch_description():
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_autostart_cmd)
     ld.add_action(declare_use_rviz_cmd)
+    ld.add_action(declare_params_file_cmd)
+
+    # # Static TF for base_scan
+    # # loopback_simulator needs this if it doesn't publish it
+    # base_scan_tf = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'base_scan'],
+    #     output='screen'
+    # )
 
     # Add nodes
-    ld.add_action(map_server_node)
+    # ld.add_action(base_scan_tf)
+    # ld.add_action(map_server_node)
     ld.add_action(mpc_controller_node)
     ld.add_action(lifecycle_manager_node)
     ld.add_action(loopback_simulator_node)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "time_constrained_mpc/mpc_logger.hpp"
 #include <memory>
 #include <vector>
 #include <string>
@@ -138,8 +139,8 @@ private:
   // MPC parameters
   double max_linear_vel_;
   double max_angular_vel_;
-  double max_linear_accel_;   // Maximum linear acceleration (Δv per time step)
-  double max_angular_accel_;  // Maximum angular acceleration (Δω per time step)
+  double max_linear_accel_;   // Max linear accel (m/s² from config, converted to m/s per timestep in on_configure)
+  double max_angular_accel_;  // Max angular accel (rad/s² from config, converted to rad/s per timestep in on_configure)
   int horizon_steps_;
   double d_t_;  // Control time step
 
@@ -156,6 +157,10 @@ private:
   // Frame IDs
   std::string map_frame_;
   std::string base_frame_;
+
+  // Logger
+  std::unique_ptr<MPCLogger> mpc_logger_;
+  std::vector<Eigen::Vector4d> last_predicted_states_;
 };
 
 }  // namespace mpc_controller
