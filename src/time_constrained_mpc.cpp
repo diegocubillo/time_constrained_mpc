@@ -139,6 +139,12 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   RCLCPP_INFO(get_logger(), "Max angular velocity: %.2f rad/s", max_angular_vel_);
   RCLCPP_INFO(get_logger(), "Max linear acceleration: %.2f m/s²", max_linear_accel_);
   RCLCPP_INFO(get_logger(), "Max angular acceleration: %.2f rad/s²", max_angular_accel_);
+  
+  // Convert accelerations from SI units (m/s², rad/s²) to velocity increments per time step
+  // This is done once here to avoid repeated calculations in the control loop
+  max_linear_accel_ *= d_t_;   // Now in m/s per time step
+  max_angular_accel_ *= d_t_;  // Now in rad/s per time step
+  
   RCLCPP_INFO(get_logger(), "=== Goal Tolerances ===");
   RCLCPP_INFO(get_logger(), "Distance tolerance: %.2f m", goal_dist_tolerance_);
   RCLCPP_INFO(get_logger(), "Theta tolerance: %.2f rad", goal_theta_tolerance_);

@@ -139,8 +139,8 @@ private:
   // MPC parameters
   double max_linear_vel_;
   double max_angular_vel_;
-  double max_linear_accel_;   // Maximum linear acceleration (Δv per time step)
-  double max_angular_accel_;  // Maximum angular acceleration (Δω per time step)
+  double max_linear_accel_;   // Max linear accel (m/s² from config, converted to m/s per timestep in on_configure)
+  double max_angular_accel_;  // Max angular accel (rad/s² from config, converted to rad/s per timestep in on_configure)
   int horizon_steps_;
   double d_t_;  // Control time step
 
