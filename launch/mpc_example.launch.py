@@ -121,7 +121,7 @@ def generate_launch_description():
         'geometry_msgs/msg/PoseWithCovarianceStamped',
         '"{header: {frame_id: "map"}, '
         'pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, '
-        'orientation: {x: 0.0, y: 0.0, z: -0.8169106, w: 0.5767644}}}}"'
+        'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}"' #-0.8169106, w: 0.5767644}}}}"'
     ]
     publish_initial_pose = TimerAction(
         period=2.0,
@@ -139,7 +139,7 @@ def generate_launch_description():
     # that sends a path to the MPC controller.
     path_cmd = [
         'ros2', 'run', 'time_constrained_mpc',
-        'send_example_path.py'
+        'send_maze_path.py'
     ]
     publish_path = TimerAction(
         period=5.0,
