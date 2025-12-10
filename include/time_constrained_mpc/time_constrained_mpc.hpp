@@ -141,7 +141,8 @@ private:
   double max_angular_vel_;
   double max_linear_accel_;   // Max linear accel (m/s² from config, converted to m/s per timestep in on_configure)
   double max_angular_accel_;  // Max angular accel (rad/s² from config, converted to rad/s per timestep in on_configure)
-  int horizon_steps_;
+  int prediction_horizon_steps_;
+  int control_horizon_steps_;
   double d_t_;  // Control time step
 
   double goal_dist_tolerance_;

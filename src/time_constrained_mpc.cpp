@@ -48,7 +48,15 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   max_angular_vel_ = this->declare_parameter<double>("max_angular_vel", 1.0);
   max_linear_accel_ = this->declare_parameter<double>("max_linear_accel", 0.2);
   max_angular_accel_ = this->declare_parameter<double>("max_angular_accel", 0.3);
-  horizon_steps_ = this->declare_parameter<int>("horizon_steps", 10);
+  prediction_horizon_steps_ = this->declare_parameter<int>("prediction_horizon_steps", 10);
+  control_horizon_steps_ = this->declare_parameter<int>("control_horizon_steps", 10);
+  
+  // Validate horizons
+  if (control_horizon_steps_ > prediction_horizon_steps_) {
+    RCLCPP_WARN(get_logger(), "Control horizon (%d) cannot be larger than prediction horizon (%d). Clamping control horizon.",
+                control_horizon_steps_, prediction_horizon_steps_);
+    control_horizon_steps_ = prediction_horizon_steps_;
+  }
   
   goal_dist_tolerance_ = this->declare_parameter<double>("goal_dist_tolerance", 0.2);
   goal_theta_tolerance_ = this->declare_parameter<double>("goal_theta_tolerance", 0.1);
@@ -126,13 +134,15 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   initialized_ = false;
 
   // Calculate horizon seconds (just for the logger)
-  double horizon_sec = horizon_steps_ * d_t_;
+  double prediction_horizon_sec = prediction_horizon_steps_ * d_t_;
+  double control_horizon_sec = control_horizon_steps_ * d_t_;
 
   // Log all configuration parameters
   RCLCPP_INFO(get_logger(), "MPCController on_configure() is called.");
   RCLCPP_INFO(get_logger(), "=== MPC Configuration Parameters ===");
   RCLCPP_INFO(get_logger(), "Controller frequency: %.1f Hz", 1.0 / d_t_);
-  RCLCPP_INFO(get_logger(), "Horizon: %d steps (%.2f sec)", horizon_steps_, horizon_sec);
+  RCLCPP_INFO(get_logger(), "Prediction Horizon: %d steps (%.2f sec)", prediction_horizon_steps_, prediction_horizon_sec);
+  RCLCPP_INFO(get_logger(), "Control Horizon: %d steps (%.2f sec)", control_horizon_steps_, control_horizon_sec);
   RCLCPP_INFO(get_logger(), "Control time step: %.3f sec", d_t_);
   RCLCPP_INFO(get_logger(), "=== Velocity Limits ===");
   RCLCPP_INFO(get_logger(), "Max linear velocity: %.2f m/s", max_linear_vel_);
@@ -209,7 +219,7 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
   
   if (mpc_logger_->open(log_file)) {
     RCLCPP_INFO(get_logger(), "MPC Logging started: %s", log_file.c_str());
-    mpc_logger_->write_header(horizon_steps_);
+    mpc_logger_->write_header(prediction_horizon_steps_);
   } else {
     RCLCPP_ERROR(get_logger(), "Failed to open MPC log file: %s", log_file.c_str());
   }
@@ -460,7 +470,7 @@ void MPCController::control_loop()
   }
   
   // Get reference trajectory for the MPC horizon based on current time
-  auto reference_trajectory = get_reference_trajectory_horizon(current_time, horizon_steps_, d_t_);
+  auto reference_trajectory = get_reference_trajectory_horizon(current_time, prediction_horizon_steps_, d_t_);
   
   // Solve MPC with temporal references
   auto cmd = solve_mpc(pose, velocity, reference_trajectory);
@@ -1016,9 +1026,9 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
         double w_pred = u_ref(1) + du_prev_(1);
         
         // Build predicted path step by step
-        for (int i = 0; i < horizon_steps_; ++i) {
+        for (int i = 0; i < prediction_horizon_steps_; ++i) {
           // Update velocity with MPC solution (accumulate increments)
-          if (i > 0) {
+          if (i > 0 && i < control_horizon_steps_) {
             v_pred += work->solution->x[2*i];      // Add Δv_i
             w_pred += work->solution->x[2*i + 1];  // Add Δω_i
           }
@@ -1088,12 +1098,14 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
       v_pred = u_ref(0) + du_prev_(0) - delta_v; // Back to u_{-1}
       w_pred = u_ref(1) + du_prev_(1) - delta_w;
       
-      last_predicted_states_.reserve(horizon_steps_);
+      last_predicted_states_.reserve(prediction_horizon_steps_);
       
-      for (int i = 0; i < horizon_steps_; ++i) {
+      for (int i = 0; i < prediction_horizon_steps_; ++i) {
          // Update velocity
-         v_pred += work->solution->x[2*i];
-         w_pred += work->solution->x[2*i + 1];
+         if (i < control_horizon_steps_) {
+           v_pred += work->solution->x[2*i];
+           w_pred += work->solution->x[2*i + 1];
+         }
          
          // Integrate
          x_pred += v_pred * c_theta_pred * d_t_;
@@ -1260,7 +1272,8 @@ void MPCController::build_mpc_matrices(
 {
   const int nx = 4;  // state dimension [x, y, sin(theta), cos(theta)]
   const int nu = 2;  // control dimension [v, omega]
-  const int N = horizon_steps_;
+  const int Np = prediction_horizon_steps_;
+  const int Nc = control_horizon_steps_;
   
   // Augmented state: [x, y, sin(theta), cos(theta), u_v, u_omega]
   const int dim_x = nx;
@@ -1277,24 +1290,11 @@ void MPCController::build_mpc_matrices(
   double c_ref = ref_state(3);  // cos(theta_ref)
   
   // ====================================================
-  // Linearized dynamics with sin/cos representation:
-  // State: [x, y, s_theta, c_theta] where s_theta = sin(theta), c_theta = cos(theta)
-  //
-  // Dynamics:
-  //   dx/dt = v * cos(theta) = v * c_theta
-  //   dy/dt = v * sin(theta) = v * s_theta
-  //   d(sin(theta))/dt = cos(theta) * dtheta/dt = c_theta * omega
-  //   d(cos(theta))/dt = -sin(theta) * dtheta/dt = -s_theta * omega
-  //
-  // Linearization around reference (s_ref, c_ref, v_ref, omega_ref):
-  //   s_{k+1} ≈ s_k + c_ref * omega * dt
-  //   c_{k+1} ≈ c_k - s_ref * omega * dt
-  //
+  // Linearized dynamics with sin/cos representation
   // State matrix A_d (4x4) - Discretized using Euler forward:
   Eigen::Matrix4d A_d = Eigen::Matrix4d::Identity();
   A_d(0, 3) = u_ref(0) * d_t_;        // dx depends on c_theta
   A_d(1, 2) = u_ref(0) * d_t_;        // dy depends on s_theta
-  // s_theta and c_theta evolution from angular velocity will be in B matrix
   
   // Control matrix B_d (4x2) - Maps [v, omega] to state derivatives
   Eigen::MatrixXd B_d = Eigen::MatrixXd::Zero(dim_x, dim_u);
@@ -1304,15 +1304,9 @@ void MPCController::build_mpc_matrices(
   B_d(3, 1) = -s_ref * d_t_;          // dc_theta/domega = -s_theta * dt
   
   // Augmented system matrices
-  // The augmented state is ξ_k = [x_k; u_{k-1}]
-  // where u_{k-1} is the PREVIOUS VELOCITY (not increment)
-  // 
   // Dynamics:
-  //   x_{k+1} = A_d·x_k + B_d·u_{k-1} + B_d·Δu_k = A_d·x_k + B_d·u_k  ✓
-  //   u_k = u_{k-1} + Δu_k  ✓
-  //
-  // This ensures the robot dynamics are physically correct:
-  //   x_{k+1} only depends on current velocity u_k, not on u_{k-2}
+  //   x_{k+1} = A_d·x_k + B_d·u_{k-1} + B_d·Δu_k
+  //   u_k = u_{k-1} + Δu_k
   Eigen::MatrixXd A_aug = Eigen::MatrixXd::Zero(dim_aug, dim_aug);
   A_aug.topLeftCorner(dim_x, dim_x) = A_d;
   A_aug.topRightCorner(dim_x, dim_u) = B_d;
@@ -1327,16 +1321,23 @@ void MPCController::build_mpc_matrices(
   C_aug.topLeftCorner(dim_x, dim_x) = Eigen::Matrix4d::Identity();
   
   // Build prediction matrices
-  Eigen::MatrixXd S_x = Eigen::MatrixXd::Zero(dim_x * N, dim_aug);
-  Eigen::MatrixXd S_u = Eigen::MatrixXd::Zero(dim_x * N, dim_u * N);
+  // S_x predicts state over Np steps
+  Eigen::MatrixXd S_x = Eigen::MatrixXd::Zero(dim_x * Np, dim_aug);
+  // S_u maps Nc control moves to Np state predictions
+  Eigen::MatrixXd S_u = Eigen::MatrixXd::Zero(dim_x * Np, dim_u * Nc);
   
   Eigen::MatrixXd A_pow = Eigen::MatrixXd::Identity(dim_aug, dim_aug);
-  for (int i = 0; i < N; ++i) {
+  for (int i = 0; i < Np; ++i) {
     A_pow = A_pow * A_aug;
     S_x.block(dim_x * i, 0, dim_x, dim_aug) = C_aug * A_pow;
     
+    // For S_u: sum over j=0 to min(i, Nc-1)
+    // The sum is \sum A^(i-j) * B * du_j
     for (int j = 0; j <= i; ++j) {
+      if (j >= Nc) break; // Don't optimize inputs beyond control horizon
+      
       Eigen::MatrixXd temp = Eigen::MatrixXd::Identity(dim_aug, dim_aug);
+      // Construct A^(i-j)
       for (int k = 0; k < i - j; ++k) {
         temp = temp * A_aug;
       }
@@ -1345,39 +1346,32 @@ void MPCController::build_mpc_matrices(
   }
   
   // Build cost matrices
-  // Q_bar: Penalizes trajectory tracking error
-  Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(dim_x * N, dim_x * N);
-  for (int i = 0; i < N; ++i) {
+  // Q_bar: Penalizes trajectory tracking error (size Np)
+  Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(dim_x * Np, dim_x * Np);
+  for (int i = 0; i < Np; ++i) {
     Q_bar.block(dim_x * i, dim_x * i, dim_x, dim_x) = Q_;
   }
   
-  // R_d_bar: Penalizes control rate changes (smoothness)
-  // NOTE: We only use R_d (not R) because we don't penalize absolute control effort
-  // This is "Option 2": only smooth movements, no energy optimization
-  Eigen::MatrixXd R_d_bar = Eigen::MatrixXd::Zero(dim_u * N, dim_u * N);
-  for (int i = 0; i < N; ++i) {
+  // R_d_bar: Penalizes control rate changes (size Nc)
+  Eigen::MatrixXd R_d_bar = Eigen::MatrixXd::Zero(dim_u * Nc, dim_u * Nc);
+  for (int i = 0; i < Nc; ++i) {
     R_d_bar.block(dim_u * i, dim_u * i, dim_u, dim_u) = R_d_;
   }
   
-  // QP problem: min 0.5 * x^T * P * x + q^T * x
-  // subject to: l <= A*x <= u
-  
-  // Build reference vector for the entire horizon
-  Eigen::VectorXd x_ref_vec(dim_x * N);
-  for (int i = 0; i < N && i < static_cast<int>(reference_trajectory.size()); ++i) {
+  // Build reference vector for the entire prediction horizon
+  Eigen::VectorXd x_ref_vec(dim_x * Np);
+  for (int i = 0; i < Np && i < static_cast<int>(reference_trajectory.size()); ++i) {
     x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory[i];
   }
-  // If reference_trajectory is shorter than N, repeat the last reference
-  for (int i = reference_trajectory.size(); i < N; ++i) {
+  // If reference_trajectory is shorter than Np, repeat the last reference
+  for (int i = reference_trajectory.size(); i < Np; ++i) {
     x_ref_vec.segment(dim_x * i, dim_x) = reference_trajectory.back();
   }
   
-  // Augmented state vector (initial state): ξ_0 = [x_current; u_{-1}]
-  // where x_current is the current robot state [x, y, sin(theta), cos(theta)]
-  // and u_{-1} = u_ref + du_prev (previous velocity, not increment)
+  // Augmented state vector (initial state)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = current_state;
-  x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity (absolute)
+  x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity
   
   // P matrix (Hessian)
   // Cost: ||x_i - x_ref||²_Q + ||Δu_i||²_{R_d}
@@ -1385,54 +1379,37 @@ void MPCController::build_mpc_matrices(
   P = P_dense.sparseView();
   
   // q vector (gradient)
-  // q = S_u^T * Q_bar * (S_x * x_aug - x_ref_vec)
   Eigen::VectorXd x_predicted = S_x * x_aug;
-  
-  // Calculate error vector
-  // With sin/cos representation, no angle normalization is needed!
-  // The error is computed directly in the continuous sin/cos space
   Eigen::VectorXd error_vec = x_predicted - x_ref_vec;
-  
   q = S_u.transpose() * Q_bar * error_vec;
   
-  // Constraints: control limits
-  // We use box constraints: l <= Δu <= u
-  // OSQP needs: l <= A*Δu <= u, where A is identity for box constraints
-  const int n_constraints = dim_u * N;  // One constraint per control variable
-  A.resize(n_constraints, dim_u * N);
+  // Constraints: control limits for Nc steps
+  const int n_constraints = dim_u * Nc;
+  A.resize(n_constraints, dim_u * Nc);
   l.resize(n_constraints);
   u.resize(n_constraints);
   
-  // Build constraint matrix (identity for box constraints)
+  // Build constraint matrix (identity)
   std::vector<Eigen::Triplet<double>> triplets;
-  for (int i = 0; i < dim_u * N; ++i) {
+  for (int i = 0; i < dim_u * Nc; ++i) {
     triplets.push_back(Eigen::Triplet<double>(i, i, 1.0));
   }
   A.setFromTriplets(triplets.begin(), triplets.end());
   
   // Calculate current accumulated velocities
-  // v_current = v_ref + du_prev
   double v_current = u_ref(0) + du_prev_(0);
   double w_current = u_ref(1) + du_prev_(1);
   
-  // Set constraint bounds for each step in the horizon
-  for (int i = 0; i < N; ++i) {
-    // Linear velocity constraints (Δv)
-    // We want: 0 <= v_current + Δv_i <= v_max
-    // Therefore: -v_current <= Δv_i <= v_max - v_current
-    // But also: -max_linear_accel_ <= Δv_i <= max_linear_accel_ (acceleration limits)
-    // Final bounds are the intersection of both constraints
+  // Set constraint bounds for each step in the control horizon
+  for (int i = 0; i < Nc; ++i) {
+    // Linear velocity constraints
     double delta_v_min = std::max(-max_linear_accel_, 0.0 - v_current);
     double delta_v_max = std::min(max_linear_accel_, max_linear_vel_ - v_current);
     
-    // Angular velocity constraints (Δω)
-    // We want: -ω_max <= w_current + Δω_i <= ω_max
-    // Therefore: -ω_max - w_current <= Δω_i <= ω_max - w_current
-    // But also: -max_angular_accel_ <= Δω_i <= max_angular_accel_ (angular acceleration limits)
+    // Angular velocity constraints
     double delta_w_min = std::max(-max_angular_accel_, -max_angular_vel_ - w_current);
     double delta_w_max = std::min(max_angular_accel_, max_angular_vel_ - w_current);
     
-    // Ensure bounds are valid (l <= u)
     if (delta_v_min > delta_v_max) delta_v_min = delta_v_max;
     if (delta_w_min > delta_w_max) delta_w_min = delta_w_max;
     
@@ -1441,11 +1418,6 @@ void MPCController::build_mpc_matrices(
     
     l(dim_u * i + 1) = delta_w_min;
     u(dim_u * i + 1) = delta_w_max;
-    
-    // Note: For simplicity, we assume the same velocity limits apply throughout
-    // the horizon. A more sophisticated approach would accumulate the deltas
-    // to predict v_i = v_current + sum(Δv_j for j=0..i-1)
-    // However, this would make the constraints coupled and non-box constraints.
   }
 }
 
