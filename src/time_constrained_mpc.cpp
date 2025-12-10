@@ -473,7 +473,8 @@ void MPCController::control_loop()
   auto reference_trajectory = get_reference_trajectory_horizon(current_time, prediction_horizon_steps_, d_t_);
   
   // Solve MPC with temporal references
-  auto cmd = solve_mpc(pose, velocity, reference_trajectory);
+  double solve_time_ms = 0.0;
+  auto cmd = solve_mpc(pose, velocity, reference_trajectory, solve_time_ms);
 
   // Publish command
   publish_velocity_command(cmd);
@@ -493,6 +494,7 @@ void MPCController::control_loop()
       ref_pose,
       spatial_error,
       cmd,
+      solve_time_ms,
       last_predicted_states_
     );
   }
@@ -878,7 +880,8 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
 geometry_msgs::msg::Twist MPCController::solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector4d> &reference_trajectory)
+    const std::vector<Eigen::Vector4d> &reference_trajectory,
+    double &solve_time_ms)
 {
   geometry_msgs::msg::Twist cmd;
   
@@ -972,10 +975,13 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
   }
   
   // Solve
+  auto start_time = std::chrono::high_resolution_clock::now();
   c_int exitflag = osqp_setup(&work, data, settings);
   
   if (exitflag == 0 && work) {
     osqp_solve(work);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    solve_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
     
     if (work->solution && work->info->status_val > 0) {
       // ===== EXTRACTION OF MPC SOLUTION =====

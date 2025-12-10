@@ -74,7 +74,8 @@ public:
   geometry_msgs::msg::Twist solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector4d> &reference_trajectory);
+    const std::vector<Eigen::Vector4d> &reference_trajectory,
+    double &solve_time_ms);
 
   // Command publication
   void publish_velocity_command(const geometry_msgs::msg::Twist &cmd);
