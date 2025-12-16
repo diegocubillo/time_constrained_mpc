@@ -182,7 +182,6 @@ This ensures the optimizer knows about both acceleration and velocity limits, pr
 - `nav2_msgs` - Nav2 action definitions
 - `tf2_ros` - TF2 transform library
 - `tf2_geometry_msgs` - TF2 geometry message conversions
-- `nav2_costmap_2d` - Nav2 costmap library
 
 ### System Libraries
 - `Eigen3` - Linear algebra library
