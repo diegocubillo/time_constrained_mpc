@@ -40,7 +40,8 @@ public:
           << "ref_x,ref_y,ref_theta,"
           << "robot_x,robot_y,robot_theta,"
           << "error_spatial,"
-          << "cmd_v,cmd_w";
+          << "cmd_v,cmd_w,"
+          << "solve_time_ms";
 
     // Add columns for predicted states (sin/cos)
     // We don't know N yet, but we can just write a generic header or assume a max N
@@ -70,6 +71,7 @@ public:
            const geometry_msgs::msg::PoseStamped & ref_pose,
            double error_spatial,
            const geometry_msgs::msg::Twist & cmd,
+           double solve_time_ms,
            const std::vector<Eigen::Vector4d> & predicted_states)
   {
     if (!file_.is_open()) return;
@@ -82,7 +84,8 @@ public:
           << ref_pose.pose.position.x << "," << ref_pose.pose.position.y << "," << ref_theta << ","
           << current_pose.pose.position.x << "," << current_pose.pose.position.y << "," << current_theta << ","
           << error_spatial << ","
-          << cmd.linear.x << "," << cmd.angular.z;
+          << cmd.linear.x << "," << cmd.angular.z << ","
+          << solve_time_ms;
 
     for (const auto & state : predicted_states) {
       // state is [x, y, sin, cos]

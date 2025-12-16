@@ -74,7 +74,8 @@ public:
   geometry_msgs::msg::Twist solve_mpc(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector4d> &reference_trajectory);
+    const std::vector<Eigen::Vector4d> &reference_trajectory,
+    double &solve_time_ms);
 
   // Command publication
   void publish_velocity_command(const geometry_msgs::msg::Twist &cmd);
@@ -141,7 +142,8 @@ private:
   double max_angular_vel_;
   double max_linear_accel_;   // Max linear accel (m/s² from config, converted to m/s per timestep in on_configure)
   double max_angular_accel_;  // Max angular accel (rad/s² from config, converted to rad/s per timestep in on_configure)
-  int horizon_steps_;
+  int prediction_horizon_steps_;
+  int control_horizon_steps_;
   double d_t_;  // Control time step
 
   double goal_dist_tolerance_;

@@ -2,7 +2,8 @@ mpc_controller:
   ros__parameters:
     # # MPC Configuration
     # controller_frequency: 10.0  # Hz
-    # horizon_steps: 10           # prediction steps
+    prediction_horizon_steps: 10  # detailed prediction
+    control_horizon_steps: 10     # optimization steps (reduce this < prediction for speed)
     
     # # Command Velocity Message Type
     # use_stamped_cmd_vel: false   # true: TwistStamped, false: Twist
