@@ -198,9 +198,20 @@ Make sure you have ROS2 (Humble or later) installed and your workspace set up.
 sudo apt-get update
 sudo apt-get install libeigen3-dev
 
+# Install OSQP (Raspberry Pi 4 / aarch64)
+# If libosqp-dev is available in your distro (e.g. newer Ubuntu):
+sudo apt-get install libosqp-dev
+# If not available, build from source:
+# git clone --recursive https://github.com/osqp/osqp
+# cd osqp && mkdir build && cd build
+# cmake -G "Unix Makefiles" ..
+# cmake --build .
+# sudo cmake --build . --target install
+# sudo ldconfig # UPDATE SHARED LIBRARY CACHE
+# See more: https://osqp.org/docs/get_started/C.html
+
 # Install ROS2 dependencies
-sudo apt-get install ros-${ROS_DISTRO}-osqp-vendor \
-                     ros-${ROS_DISTRO}-eigen3-cmake-module \
+sudo apt-get install ros-${ROS_DISTRO}-eigen3-cmake-module \
                      ros-${ROS_DISTRO}-nav2-msgs \
                      ros-${ROS_DISTRO}-tf2-ros \
                      ros-${ROS_DISTRO}-tf2-geometry-msgs
