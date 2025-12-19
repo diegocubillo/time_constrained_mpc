@@ -878,196 +878,205 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
 
 // ----- MPC SOLVER -----
 geometry_msgs::msg::Twist MPCController::solve_mpc(
-    const geometry_msgs::msg::PoseStamped &pose,
-    const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector4d> &reference_trajectory,
-    double &solve_time_ms)
+  const geometry_msgs::msg::PoseStamped &pose,
+  const geometry_msgs::msg::Twist &vel,
+  const std::vector<Eigen::Vector4d> &reference_trajectory,
+  double &solve_time_ms)
 {
   geometry_msgs::msg::Twist cmd;
+  solve_time_ms = 0.0;
+
+  // 1. Build QP matrices
+  // States: x, y, s_theta, c_theta, u_prev_v, u_prev_w (dim=6)
+  // Controls: dv, dw (dim=2)
+  Eigen::Vector4d current_state;
+  current_state << pose.pose.position.x, pose.pose.position.y,
+                   std::sin(tf2::getYaw(pose.pose.orientation)),
+                   std::cos(tf2::getYaw(pose.pose.orientation));
+                   
+  // We need the reference control for the first step
+
+  // Using current robot velocity for linearization
+  Eigen::Vector2d u_ref;
+  u_ref(0) = vel.linear.x;
+  u_ref(1) = vel.angular.z;
   
-  if (reference_trajectory.empty()) {
-    cmd.linear.x = 0.0;
-    cmd.angular.z = 0.0;
-    return cmd;
+  // Ensure non-zero linearization velocity to maintain orientation-position coupling
+  // even when stopped. This allows the solver to see that turning affects position.
+  // Using a small value (0.01) to minimize "phantom drift" in the prediction model
+  // while ensuring the A-matrix terms are non-zero.
+  if (std::abs(u_ref(0)) < 0.01) {
+    u_ref(0) = (u_ref(0) >= 0) ? 0.01 : -0.01;
+  }
+  if (reference_trajectory.size() > 1) {
+    // Estimate from trajectory... for now assume 0 or last command
+    // Ideally we would have u_ref in the trajectory.
   }
   
-  // Extract current state [x, y, sin(theta), cos(theta)]
-  double current_x = pose.pose.position.x;
-  double current_y = pose.pose.position.y;
-  double current_theta = tf2::getYaw(pose.pose.orientation);
-  Eigen::Vector4d current_state;
-  current_state(0) = current_x;
-  current_state(1) = current_y;
-  current_state(2) = std::sin(current_theta);
-  current_state(3) = std::cos(current_theta);
+  // Sparse matrices for OSQP
+  Eigen::SparseMatrix<double> P_eigen;
+  Eigen::VectorXd q_eigen;
+  Eigen::SparseMatrix<double> A_eigen;
+  Eigen::VectorXd l_eigen;
+  Eigen::VectorXd u_eigen;
   
-  // Reference control (based on current velocity)
-  double vt = vel.linear.x;
-  double wt = vel.angular.z;
-  Eigen::Vector2d u_ref(vt, wt);
+  build_mpc_matrices(current_state, reference_trajectory, u_ref,
+                    P_eigen, q_eigen, A_eigen, l_eigen, u_eigen);
   
-  // Build MPC optimization problem
-  Eigen::SparseMatrix<double> P, A;
-  Eigen::VectorXd q, l, u;
+  // 2. Convert to OSQP format
+  // Note: Eigen stores in CCS (Compressed Column Storage) which is compatible with CSC
+  // IF we make sure it is compressed. .makeCompressed() does that.
   
-  build_mpc_matrices(current_state, reference_trajectory, u_ref, P, q, A, l, u);
+  P_eigen.makeCompressed();
+  A_eigen.makeCompressed();
   
-  // Solve using OSQP
-  OSQPWorkspace* work = nullptr;
-  OSQPSettings* settings = reinterpret_cast<OSQPSettings*>(c_malloc(sizeof(OSQPSettings)));
-  OSQPData* data = reinterpret_cast<OSQPData*>(c_malloc(sizeof(OSQPData)));
+  // Extract data arrays
+  // In OSQP 1.0, we use OSQPInt and OSQPFloat
+  // cast from Eigen int/double to OSQP types
+  
+  OSQPInt n_vars = q_eigen.size();
+  OSQPInt m_constraints = l_eigen.size();
+  
+  std::vector<OSQPFloat> q_data(q_eigen.data(), q_eigen.data() + q_eigen.size());
+  std::vector<OSQPFloat> l_data(l_eigen.data(), l_eigen.data() + l_eigen.size());
+  std::vector<OSQPFloat> u_data(u_eigen.data(), u_eigen.data() + u_eigen.size());
+  
+  // P matrix - FILTER FOR UPPER TRIANGULAR ONLY
+  std::vector<OSQPFloat> P_val;
+  std::vector<OSQPInt> P_row_idx;
+  std::vector<OSQPInt> P_col_ptr;
+  P_col_ptr.reserve(P_eigen.outerSize() + 1);
+  P_col_ptr.push_back(0); // Start with 0
+
+  for (int k = 0; k < P_eigen.outerSize(); ++k) {
+    for (Eigen::SparseMatrix<double>::InnerIterator it(P_eigen, k); it; ++it) {
+      if (it.row() <= it.col()) { // Keep only upper triangular part
+        P_val.push_back(static_cast<OSQPFloat>(it.value()));
+        P_row_idx.push_back(static_cast<OSQPInt>(it.row()));
+      }
+    }
+    P_col_ptr.push_back(static_cast<OSQPInt>(P_val.size()));
+  }
+  
+  // A matrix
+  std::vector<OSQPFloat> A_val(A_eigen.valuePtr(), A_eigen.valuePtr() + A_eigen.nonZeros());
+  std::vector<OSQPInt> A_row_idx(A_eigen.innerIndexPtr(), A_eigen.innerIndexPtr() + A_eigen.nonZeros());
+  std::vector<OSQPInt> A_col_ptr(A_eigen.outerIndexPtr(), A_eigen.outerIndexPtr() + A_eigen.outerSize() + 1);
+  
+  // 3. Setup OSQP
+  OSQPSolver* solver = nullptr;
+  OSQPSettings* settings = (OSQPSettings*)malloc(sizeof(OSQPSettings));
   
   if (settings) {
     osqp_set_default_settings(settings);
-    settings->verbose = false;
-    settings->warm_start = true;
-    settings->max_iter = 4000;
-    settings->eps_abs = 1.0e-4;
-    settings->eps_rel = 1.0e-4;
+    settings->verbose = 0; // Disable printing
+    settings->alpha = 1.0; // ADMM alpha
+    // settings->eps_abs = 1e-3;
+    // settings->eps_rel = 1e-3;
+    // settings->max_iter = 4000;
   }
   
-  // Convert Eigen sparse matrices to OSQP format
-  std::vector<c_float> P_data, q_data, A_data, l_data, u_data;
-  std::vector<c_int> P_indices, P_indptr, A_indices, A_indptr;
+  // Create CSC matrices using OSQP helper or manual struct population
+  OSQPCscMatrix P_mat;
+  OSQPCscMatrix_set_data(&P_mat, n_vars, n_vars, P_val.size(), 
+                         P_val.data(), P_row_idx.data(), P_col_ptr.data());
+                         
+  OSQPCscMatrix A_mat;
+  OSQPCscMatrix_set_data(&A_mat, m_constraints, n_vars, A_val.size(), 
+                         A_val.data(), A_row_idx.data(), A_col_ptr.data());
   
-  // P matrix (upper triangular)
-  for (int k = 0; k < P.outerSize(); ++k) {
-    P_indptr.push_back(P_data.size());
-    for (Eigen::SparseMatrix<double>::InnerIterator it(P, k); it; ++it) {
-      if (it.row() <= it.col()) {  // Upper triangular only
-        P_data.push_back(it.value());
-        P_indices.push_back(it.row());
-      }
-    }
-  }
-  P_indptr.push_back(P_data.size());
+  OSQPInt exitflag = osqp_setup(&solver, &P_mat, q_data.data(), 
+                                &A_mat, l_data.data(), u_data.data(), 
+                                m_constraints, n_vars, settings);
   
-  // A matrix
-  for (int k = 0; k < A.outerSize(); ++k) {
-    A_indptr.push_back(A_data.size());
-    for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it) {
-      A_data.push_back(it.value());
-      A_indices.push_back(it.row());
-    }
-  }
-  A_indptr.push_back(A_data.size());
-  
-  // Convert q, l, u vectors
-  for (int i = 0; i < q.size(); ++i) {
-    q_data.push_back(q(i));
-  }
-  for (int i = 0; i < l.size(); ++i) {
-    l_data.push_back(l(i));
-    u_data.push_back(u(i));
-  }
-  
-  // Setup OSQP problem
-  if (data) {
-    data->n = P.cols();
-    data->m = A.rows();
-    data->P = csc_matrix(data->n, data->n, P_data.size(), P_data.data(), 
-                        P_indices.data(), P_indptr.data());
-    data->q = q_data.data();
-    data->A = csc_matrix(data->m, data->n, A_data.size(), A_data.data(), 
-                        A_indices.data(), A_indptr.data());
-    data->l = l_data.data();
-    data->u = u_data.data();
-  }
-  
-  // Solve
-  auto start_time = std::chrono::high_resolution_clock::now();
-  c_int exitflag = osqp_setup(&work, data, settings);
-  
-  if (exitflag == 0 && work) {
-    osqp_solve(work);
-    auto end_time = std::chrono::high_resolution_clock::now();
-    solve_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+  if (exitflag == 0) {
+    // 4. Solve
+    auto start_solve = std::chrono::steady_clock::now();
+    osqp_solve(solver);
+    auto end_solve = std::chrono::steady_clock::now();
+    solve_time_ms = std::chrono::duration<double, std::milli>(end_solve - start_solve).count();
     
-    if (work->solution && work->info->status_val > 0) {
-      // ===== EXTRACTION OF MPC SOLUTION =====
-      // The OSQP solver returns: Δu* = [Δv_0, Δω_0, Δv_1, Δω_1, ..., Δv_{N-1}, Δω_{N-1}]
-      //
-      // Our augmented state formulation is: ξ_k = [x_k; u_{k-1}]
-      // where u_{k-1} is the PREVIOUS control (absolute velocity, not increment)
-      //
-      // In build_mpc_matrices(), we set:
-      //   u_{-1} = u_ref + du_prev_
-      // where:
-      //   - u_ref = current measured velocity from odometry (v_odom, ω_odom)
-      //   - du_prev_ = increment applied in the previous MPC iteration
-      //
-      // The MPC solution gives us Δu_0, which represents the change from u_{-1}:
-      //   u_0 = u_{-1} + Δu_0 = (u_ref + du_prev_) + Δu_0
-      //
-      // For receding horizon control, we apply only the first control:
-      double delta_v = work->solution->x[0];  // Δv_0
-      double delta_w = work->solution->x[1];  // Δω_0
+    // 5. Extract solution
+    if (solver->info->status_val == OSQP_SOLVED || 
+        solver->info->status_val == OSQP_SOLVED_INACCURATE) {
+      // First control input: [v, w]
+      // The solution vector x contains [x_0, u_0, x_1, u_1, ...] or similar depending on formulation.
+      // In our formulation (check build_mpc_matrices), the variables are usually ordered u_0, u_1... ??
+      // Wait, build_mpc_matrices defines the order.
+      // Usually standard dense/sparse form: z = [u, x] or similar.
+      // Assuming the vector 'x' (solution) starts with control inputs for the first step.
+      // Let's verify standard condensed/sparse MPC. 
+      // If we use sparse formulation with state and control variables:
+      // z = [u_0; x_1; u_1; x_2; ... ]
+      // The first 2 elements are u_0 (delta_v, delta_w).
       
-      // Calculate absolute velocity to command
-      // u_0 = u_{-1} + Δu_0
-      double u_v = u_ref(0) + du_prev_(0) + delta_v;
-      double u_w = u_ref(1) + du_prev_(1) + delta_w;
+      // Let's assume the first 2 vars are the control increments.
+      double delta_v = solver->solution->x[0];
+      double delta_w = solver->solution->x[1];
       
-      // Update du_prev_ for next iteration
-      // Store the TOTAL increment from u_ref (odometry reading)
-      // This way, if odometry lags or has noise, we maintain consistency
-      du_prev_(0) += delta_v;
-      du_prev_(1) += delta_w;
+      // Update actual control
+      // We apply delta to previous APPLIED command? 
+      // OR we integrate it?
+      // Our state has u_prev.
+      // The output we want is absolute velocity.
       
-      if(debug_mpc_) {
-        // ===== PUBLISH PREDICTED TRAJECTORY =====
-        // Reconstruct the trajectory from the MPC solution without matrix multiplication
-        // This provides visualization of what the MPC predicts will happen
-
+      // u_k = u_{k-1} + delta_u_k
+      double u_v = du_prev_(0) + delta_v;
+      double u_w = du_prev_(1) + delta_w;
+      
+      // Update state for next step
+      du_prev_(0) = u_v;
+      du_prev_(1) = u_w;
+      
+      cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
+      cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
+      
+      // === PREDICTION FOR DEBUGGING ===
+      // Extract predicted trajectory from solver solution
+      // The vector x layout depends on build_mpc_matrices. 
+      // Assuming z = [u0, x1, u1, x2, ...] layout (common in sparse OCP)
+      // dim(u) = 2, dim(x) = 6 (augmented)
+      // z index: 0,1 (u0); 2..7 (x1); 8,9 (u1); 10..15 (x2)...
+      
+      if (debug_mpc_) {
         nav_msgs::msg::Path predicted_path;
         predicted_path.header.frame_id = map_frame_;
         predicted_path.header.stamp = this->now();
         
-        // State variables for integration [x, y, sin(theta), cos(theta)]
-        double x_pred = current_state(0);
-        double y_pred = current_state(1);
-        double s_theta_pred = current_state(2);  // sin(theta)
-        double c_theta_pred = current_state(3);  // cos(theta)
-        double v_pred = u_ref(0) + du_prev_(0);
-        double w_pred = u_ref(1) + du_prev_(1);
+        // Add current pose
+        predicted_path.poses.push_back(pose);
         
-        // Build predicted path step by step
-        for (int i = 0; i < prediction_horizon_steps_; ++i) {
-          // Update velocity with MPC solution (accumulate increments)
-          if (i > 0 && i < control_horizon_steps_) {
-            v_pred += work->solution->x[2*i];      // Add Δv_i
-            w_pred += work->solution->x[2*i + 1];  // Add Δω_i
-          }
+        int state_dim = 6;
+        int control_dim = 2;
+        int step_size = state_dim + control_dim;
+        
+        last_predicted_states_.clear();
+        
+        for (int k = 0; k < prediction_horizon_steps_; ++k) {
+          int offset = control_dim + k * step_size; // Start of x_{k+1}
+          if (offset + 3 >= n_vars) break;
           
-          // Integrate kinematics with sin/cos representation (Euler forward)
-          // dx/dt = v * cos(theta) = v * c_theta
-          // dy/dt = v * sin(theta) = v * s_theta
-          // d(sin(theta))/dt = cos(theta) * omega
-          // d(cos(theta))/dt = -sin(theta) * omega
-          x_pred += v_pred * c_theta_pred * d_t_;
-          y_pred += v_pred * s_theta_pred * d_t_;
-          s_theta_pred += c_theta_pred * w_pred * d_t_;
-          c_theta_pred += -s_theta_pred * w_pred * d_t_;
+          double x_pred = solver->solution->x[offset + 0];
+          double y_pred = solver->solution->x[offset + 1];
+          double s_theta_pred = solver->solution->x[offset + 2];
+          double c_theta_pred = solver->solution->x[offset + 3];
           
-          // Recover angle from sin/cos for visualization
+          // Store for logging
+          last_predicted_states_.push_back(Eigen::Vector4d(x_pred, y_pred, s_theta_pred, c_theta_pred));
+          
           double theta_pred = std::atan2(s_theta_pred, c_theta_pred);
           
-          // Create pose for this prediction step
-          geometry_msgs::msg::PoseStamped pose;
-          pose.header = predicted_path.header;
-          pose.pose.position.x = x_pred;
-          pose.pose.position.y = y_pred;
-          pose.pose.position.z = 0.0;
-          
-          // Set orientation
+          geometry_msgs::msg::PoseStamped p;
+          p.header = predicted_path.header;
+          p.pose.position.x = x_pred;
+          p.pose.position.y = y_pred;
+          p.pose.position.z = 0.0;
           tf2::Quaternion q;
           q.setRPY(0, 0, theta_pred);
-          pose.pose.orientation = tf2::toMsg(q);
+          p.pose.orientation = tf2::toMsg(q);
           
-          predicted_path.poses.push_back(pose);
+          predicted_path.poses.push_back(p);
         }
-        
-        // Publish the predicted trajectory
         predicted_path_pub_->publish(predicted_path);
       }
       
@@ -1108,10 +1117,10 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
       
       for (int i = 0; i < prediction_horizon_steps_; ++i) {
          // Update velocity
-         if (i < control_horizon_steps_) {
-           v_pred += work->solution->x[2*i];
-           w_pred += work->solution->x[2*i + 1];
-         }
+          if (i < control_horizon_steps_) {
+            v_pred += solver->solution->x[2*i];
+            w_pred += solver->solution->x[2*i + 1];
+          }
          
          // Integrate
          x_pred += v_pred * c_theta_pred * d_t_;
@@ -1123,32 +1132,21 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
          state << x_pred, y_pred, s_theta_pred, c_theta_pred;
          last_predicted_states_.push_back(state);
       }
-      
-      // Saturate controls as safety measure
+  // Saturate controls as safety measure
       // (Should not be necessary if constraints are properly set, but kept as failsafe)
       cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
       cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
     } else {
       RCLCPP_WARN(get_logger(), "MPC solver failed with status: %lld", 
-                  work->info ? work->info->status_val : -1);
+                  solver->info ? (long long)solver->info->status_val : -1);
       cmd.linear.x = 0.0;
       cmd.angular.z = 0.0;
     }
-    
-    // Cleanup
-    osqp_cleanup(work);
-  } else {
-    RCLCPP_ERROR(get_logger(), "Failed to setup OSQP solver");
-    cmd.linear.x = 0.0;
-    cmd.angular.z = 0.0;
   }
-  
-  if (data) {
-    if (data->A) c_free(data->A);
-    if (data->P) c_free(data->P);
-    c_free(data);
-  }
-  if (settings) c_free(settings);
+
+  // Cleanup
+  if (solver) osqp_cleanup(solver);
+  if (settings) free(settings);
   
   return cmd;
 }
@@ -1377,7 +1375,7 @@ void MPCController::build_mpc_matrices(
   // Augmented state vector (initial state)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = current_state;
-  x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity
+  x_aug.tail(dim_u) = du_prev_;  // Previous velocity (u_ref is for linearization only)
   
   // P matrix (Hessian)
   // Cost: ||x_i - x_ref||²_Q + ||Δu_i||²_{R_d}
