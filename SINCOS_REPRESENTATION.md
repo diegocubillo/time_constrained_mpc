@@ -1,156 +1,103 @@
-# Sin/Cos Angular Representation in MPC
+# Internal Logic & Sin/Cos Representation
 
-## Motivación
+This document details the mathematical formulation and internal logic of the `time_constrained_mpc` controller.
 
-El MPC anterior presentaba problemas de linealización del ángulo `theta` debido a:
-1. **Pérdida de precisión**: La aproximación lineal se degrada cuando |theta| crece
-2. **Discontinuidades**: Saltos bruscos en ±π que afectan las matrices del MPC
-3. **Complejidad**: Necesidad de estrategias avanzadas de normalización angular
+## 1. State Representation
 
-## Solución: Representación Sin/Cos
+To avoid angular discontinuities (wrapping at $\pm\pi$) and singularities, the controller represents orientation using both sine and cosine.
 
-En lugar de usar `theta` directamente, representamos la orientación con dos variables:
-- `s_theta = sin(theta)` 
-- `c_theta = cos(theta)`
+### State Vector ($x_{aug}$)
+The solver uses an **augmented state vector** of dimension 6:
 
-### Ventajas
+$$
+x_{aug} = \begin{bmatrix} 
+x \\ 
+y \\ 
+\sin(\theta) \\ 
+\cos(\theta) \\ 
+v_{prev} \\ 
+\omega_{prev} 
+\end{bmatrix}
+$$
 
-1. **Continuidad**: `sin(theta)` y `cos(theta)` son funciones continuas sin discontinuidades
-2. **Linealización precisa**: Las derivadas parciales son bien comportadas en todo el dominio
-3. **Sin normalización**: No es necesario preocuparse por ventanas angulares o "furthest theta"
-4. **Simplicidad**: Código más limpio y mantenible
+- $x, y$: Robot position in map frame.
+- $\sin(\theta), \cos(\theta)$: Orientation components.
+- $v_{prev}, \omega_{prev}$: Control inputs applied at the *previous* step.
 
-## Cambios en el Estado
+### Control Vector ($\Delta u$)
+The optimizer solves for **control increments** (dimension 2), not absolute velocities:
 
-### Estado anterior
-```
-x = [x, y, theta]  (dimensión 3)
-```
+$$
+\Delta u = \begin{bmatrix} 
+\Delta v \\ 
+\Delta \omega 
+\end{bmatrix}
+$$
 
-### Estado nuevo
-```
-x = [x, y, sin(theta), cos(theta)]  (dimensión 4)
-```
+This formulation forces the cost function to penalize *changes* in velocity (acceleration/jerk), promoting smoothness.
 
-## Dinámica del Sistema
+## 2. Differential Drive Dynamics
 
-### Modelo cinemático
-Las ecuaciones de movimiento de un robot diferencial son:
+The continuous kinematic model is:
 
-```
-dx/dt = v * cos(theta) = v * c_theta
-dy/dt = v * sin(theta) = v * s_theta
-d(sin(theta))/dt = cos(theta) * dtheta/dt = c_theta * omega
-d(cos(theta))/dt = -sin(theta) * dtheta/dt = -s_theta * omega
-```
+$$
+\begin{align}
+\dot{x} &= v \cos \theta \\
+\dot{y} &= v \sin \theta \\
+\dot{\sin \theta} &= \cos \theta \cdot \omega \\
+\dot{\cos \theta} &= -\sin \theta \cdot \omega
+\end{align}
+$$
 
-### Linealización
+### Linearization
+The MPC linearizes this model around the **current robot velocity** ($u_{ref}$).
+*Crucially*, if the robot is stopped ($v \approx 0$), the model would lose steerability (changing $\theta$ wouldn't affect $x, y$). To prevent this, we enforce a minimum linearization velocity:
+$$ |v_{ref}| = \max(|v_{measured}|, 0.1) $$
 
-Alrededor de un punto de referencia `(s_ref, c_ref, v_ref, omega_ref)`, las matrices discretizadas son:
+The discrete linearized matrices $A_d$ (4x4) and $B_d$ (4x2) are derived using Euler forward integration:
 
-**Matriz de estado A_d (4x4):**
-```
-A_d = [1    0    0           v_ref*dt  ]
-      [0    1    v_ref*dt    0         ]
-      [0    0    1           0         ]
-      [0    0    0           1         ]
-```
+$$
+x_{k+1} \approx A_d x_k + B_d u_k
+$$
 
-**Matriz de control B_d (4x2):**
-```
-B_d = [c_ref*dt     0          ]
-      [s_ref*dt     0          ]
-      [0            c_ref*dt   ]
-      [0            -s_ref*dt  ]
-```
+Where terms like $\Delta x \approx v_{ref} \cos(\theta_{ref}) \Delta t$ appear in $A_d$ and terms like $\Delta x \approx \cos(\theta_{ref}) \Delta t \Delta v$ appear in $B_d$.
 
-Donde:
-- Columna 1 (velocidad lineal v): Afecta x, y mediante cos/sin de la orientación
-- Columna 2 (velocidad angular ω): Afecta la evolución de sin(θ) y cos(θ)
+### Augmented Dynamics
+To optimize increments $\Delta u$, we augment the system:
 
-## Extracción del Ángulo
+$$
+\begin{bmatrix} x_{k+1} \\ u_k \end{bmatrix} = 
+\begin{bmatrix} A_d & B_d \\ 0 & I \end{bmatrix} 
+\begin{bmatrix} x_k \\ u_{k-1} \end{bmatrix} + 
+\begin{bmatrix} B_d \\ I \end{bmatrix} \Delta u_k
+$$
 
-Cuando se necesita el ángulo real (por ejemplo, para publicar la pose), se recupera mediante:
+This is the standard form $X_{k+1} = A_{aug} X_k + B_{aug} \Delta U_k$.
 
-```cpp
-theta = atan2(s_theta, c_theta)
-```
+## 3. Optimization Problem (OSQP)
 
-Esta operación mantiene el ángulo en el rango [-π, π] automáticamente.
+We solve the following Quadratic Program (QP) at 10Hz:
 
-## Matriz de Pesos
+$$
+\min_{\Delta U} \sum_{k=0}^{N_p} \| x_k - x_{ref,k} \|^2_Q + \sum_{k=0}^{N_c} \| \Delta u_k \|^2_{R_d}
+$$
 
-La matriz Q pasó de 3x3 a 4x4:
+### Constraints
+1.  **Dynamics**: Enforced via the prediction matrices $S_x, S_u$.
+2.  **Control Limits (Box)**:
+    - Acceleration bounds: $\Delta u_{min} \le \Delta u \le \Delta u_{max}$
+    - Velocity bounds: Implemented dynamically by clipping the acceleration bounds based on current velocity.
 
-**Anterior:**
-```yaml
-Q_matrix_diag: [3000.0, 3000.0, 5.0]  # [x, y, theta]
-```
+### Implicit Geometric Constraint
+$$ \sin^2(\theta) + \cos^2(\theta) = 1 $$
+**Usage Note**: This quadratic equality constraint is **NOT enforced** by the OSQP solver (which only handles linear constraints).
+- **Consequence**: The state vector can technically drift off the unit circle.
+- **Mitigation**: The MPC re-plans every 100ms. The predicted horizon is short enough that drift is negligible. The reference trajectory itself is on the unit circle, creating a "soft" constraint via the $Q$ matrix.
 
-**Actual:**
-```yaml
-Q_matrix_diag: [3000.0, 3000.0, 5.0, 5.0]  # [x, y, sin(θ), cos(θ)]
-```
+## 4. Implementation Details
 
-Los pesos para `sin(θ)` y `cos(θ)` se mantienen iguales y relativamente bajos, ya que la orientación es secundaria comparada con la posición.
-
-## Validación
-
-Para verificar que la representación es correcta, debe cumplirse:
-
-```
-sin²(theta) + cos²(theta) = 1
-```
-
-Esta restricción es una **invariante del sistema** que el MPC mantiene aproximadamente a través de la dinámica correcta.
-
-## Código Eliminado
-
-Se eliminaron las siguientes funciones que ya no son necesarias:
-- `calculate_furthest_theta()`: Calculaba el ángulo más lejano para normalización
-- `normalize_angle_around()`: Normalizaba ángulos a ventanas customizadas
-
-Estas funciones eran parte de la estrategia de normalización angular avanzada que ahora es obsoleta con la representación sin/cos.
-
-## Impacto en el Rendimiento
-
-- **Dimensión del estado**: 3 → 4 (aumento de ~33%)
-- **Dimensión augmentada**: 5 → 6
-- **Complejidad computacional**: Mínimo impacto debido a que el aumento es pequeño
-- **Calidad de control**: Mejora esperada por mejor linealización y ausencia de discontinuidades
-
-## Nota sobre la Restricción sin²(θ) + cos²(θ) = 1
-
-### Estado Actual
-La implementación actual **NO impone explícitamente** esta restricción geométrica en el optimizador. Esto es porque:
-
-1. **OSQP solo soporta restricciones lineales**, no cuadráticas
-2. Añadir esta restricción requeriría un solver NLP (IPOPT, SNOPT) que es **10-40x más lento**
-3. **En la práctica, el controlador funciona excelentemente sin la restricción**
-
-### Violación Esperada
-Con los parámetros por defecto (ω_max=1.0 rad/s, dt=0.1s, N=10):
-```
-Δnorm ≈ 0.5 * ω_max² * dt² * N ≈ 5%
-```
-
-Sin embargo, gracias a que:
-- El MPC re-optimiza en cada ciclo (bucle cerrado)
-- Solo se aplica el primer control
-- Los errores no se acumulan indefinidamente
-
-**El sistema es estable y funciona bien** para aplicaciones de seguimiento de trayectorias.
-
-### Si se Necesita Mayor Precisión
-Si la aplicación requiere orientación muy precisa:
-1. **Opción 1 (recomendada)**: Aumentar frecuencia de control (reduce dt²)
-2. **Opción 2**: Proyección post-optimización (normalizar después de resolver)
-3. **Opción 3**: Cambiar a solver NLP (IPOPT) con restricción explícita
-
-Ver `README.md` para detalles sobre cuándo preocuparse por este problema y cómo mitigarlo.
-
-## Referencias
-
-- Representación sin/cos es estándar en control de sistemas robóticos
-- Similar a usar cuaterniones para evitar "gimbal lock" en 3D
-- Ver: "Predictive Control for Linear and Hybrid Systems" - Borrelli et al.
+- **Upper Triangular P**: OSQP requires the cost matrix $P$ to be upper triangular. The code explicitly filters the Eigen matrix to remove the lower triangular part before passing it to the C API.
+- **Reference Generation**:
+    - The controller receives a path with timestamps.
+    - `get_reference_trajectory_horizon` interpolates this path to find exactly where the robot *should* be at $t, t+\Delta t, t+2\Delta t...$
+    - This allows for "Time Constrained" behavior: if the robot is late, the reference is ahead, creating a larger error term that drives higher velocities.
