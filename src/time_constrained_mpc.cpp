@@ -894,17 +894,20 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
                    std::sin(tf2::getYaw(pose.pose.orientation)),
                    std::cos(tf2::getYaw(pose.pose.orientation));
                    
-  // Current control input (from previous step or 0 if start)
-  Eigen::Vector2d u_current = du_prev_; // approximation, actually du_prev accumulates
-  // A better approx for linearization is the reference control u_ref, 
-  // but we usually linearize around trajectory.
-  
-  // Actually, we need to pass the initial state deviation.
-  // The state vector in MPC is deviation: x_k - x_ref_k ? No, formulation depends.
-  // In our build_mpc_matrices, we construct the full QP.
-  
   // We need the reference control for the first step
-  Eigen::Vector2d u_ref = Eigen::Vector2d::Zero();
+
+  // Using current robot velocity for linearization
+  Eigen::Vector2d u_ref;
+  u_ref(0) = vel.linear.x;
+  u_ref(1) = vel.angular.z;
+  
+  // Ensure non-zero linearization velocity to maintain orientation-position coupling
+  // even when stopped. This allows the solver to see that turning affects position.
+  // Using a small value (0.01) to minimize "phantom drift" in the prediction model
+  // while ensuring the A-matrix terms are non-zero.
+  if (std::abs(u_ref(0)) < 0.01) {
+    u_ref(0) = (u_ref(0) >= 0) ? 0.01 : -0.01;
+  }
   if (reference_trajectory.size() > 1) {
     // Estimate from trajectory... for now assume 0 or last command
     // Ideally we would have u_ref in the trajectory.
@@ -917,7 +920,6 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
   Eigen::VectorXd l_eigen;
   Eigen::VectorXd u_eigen;
   
-  auto start_build = std::chrono::steady_clock::now();
   build_mpc_matrices(current_state, reference_trajectory, u_ref,
                     P_eigen, q_eigen, A_eigen, l_eigen, u_eigen);
   
@@ -1373,7 +1375,7 @@ void MPCController::build_mpc_matrices(
   // Augmented state vector (initial state)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = current_state;
-  x_aug.tail(dim_u) = u_ref + du_prev_;  // Previous velocity
+  x_aug.tail(dim_u) = du_prev_;  // Previous velocity (u_ref is for linearization only)
   
   // P matrix (Hessian)
   // Cost: ||x_i - x_ref||²_Q + ||Δu_i||²_{R_d}
