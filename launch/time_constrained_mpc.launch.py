@@ -1,12 +1,9 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import LifecycleNode
-from launch.actions import EmitEvent
-from launch.actions import RegisterEventHandler
-from launch_ros.events.lifecycle import ChangeState
-from launch_ros.event_handlers import OnStateTransition
-from lifecycle_msgs.msg import Transition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node, LifecycleNode
+from launch.actions import DeclareLaunchArgument
 
 
 def generate_launch_description():
@@ -15,6 +12,12 @@ def generate_launch_description():
 
     # Path to the parameters file
     params_file = os.path.join(pkg_dir, 'config', 'mpc_params.yaml')
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation time'
+    )
 
     # Create the MPC controller lifecycle node
     mpc_node = LifecycleNode(
@@ -27,35 +30,21 @@ def generate_launch_description():
         emulate_tty=True
     )
 
-    # Event to configure the node
-    configure_event = EmitEvent(
-        event=ChangeState(
-            lifecycle_node_matcher=(
-                lambda node: node.name == 'mpc_controller'),
-            transition_id=Transition.TRANSITION_CONFIGURE,
-        )
-    )
-
-    # Event to activate the node after configuration
-    activate_event = RegisterEventHandler(
-        OnStateTransition(
-            target_lifecycle_node=mpc_node,
-            goal_state='inactive',
-            entities=[
-                EmitEvent(
-                    event=ChangeState(
-                        lifecycle_node_matcher=lambda node: (
-                            node.name == 'mpc_controller'
-                        ),
-                        transition_id=Transition.TRANSITION_ACTIVATE,
-                    )
-                ),
-            ],
-        )
-    )
+    # Lifecycle manager
+    lifecycle_manager_node = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager',
+        parameters=[
+            {
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'autostart' : True,
+                'node_names': ['mpc_controller']
+            }
+        ])
 
     return LaunchDescription([
+        use_sim_time_arg,
         mpc_node,
-        configure_event,
-        activate_event,
+        lifecycle_manager_node
     ])
