@@ -135,7 +135,7 @@ private:
   bool initialized_{false};
   bool has_odom_{false};
   bool initial_rotation_completed_{false};
-  Eigen::Vector2d du_prev_{Eigen::Vector2d::Zero()};
+  Eigen::Vector2d u_prev_{Eigen::Vector2d::Zero()};
 
   // MPC parameters
   double max_linear_vel_;

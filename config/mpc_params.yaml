@@ -2,7 +2,7 @@ mpc_controller:
   ros__parameters:
     # # MPC Configuration
     # controller_frequency: 10.0  # Hz
-    prediction_horizon_steps: 10  # detailed prediction
+    prediction_horizon_steps: 20  # detailed prediction
     control_horizon_steps: 10     # optimization steps (reduce this < prediction for speed)
     
     # # Command Velocity Message Type
@@ -15,11 +15,11 @@ mpc_controller:
     max_angular_accel: 3.0      # rad/s² (increased for quicker angular response)
     
     # # Goal Tolerances
-    # goal_dist_tolerance: 0.2    # meters
+    goal_dist_tolerance: 0.1    # meters
     goal_theta_tolerance: 0.15   # radians (approx 8.6 degrees)
     
     # Path Smoothing
-    path_smoothing_window: 0.0  # meters - smooths sharp corners
+    path_smoothing_window: 0.5  # meters - smooths sharp corners
 
     # Enable MPC Debugging Output
     # debug_mpc: true

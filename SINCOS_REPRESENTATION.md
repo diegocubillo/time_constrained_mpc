@@ -1,103 +1,123 @@
-# Internal Logic & Sin/Cos Representation
+# Non-Linear MPC Formulation for Differential Drive Robots
 
-This document details the mathematical formulation and internal logic of the `time_constrained_mpc` controller.
+This document presents the mathematical foundation of the `time_constrained_mpc` controller. The system employs a **Successive Linearization Model Predictive Control (MPC)** strategy, formulated as a Quadratic Program (QP) and solved via **OSQP**.
 
-## 1. State Representation
+## 1. System Dynamics
 
-To avoid angular discontinuities (wrapping at $\pm\pi$) and singularities, the controller represents orientation using both sine and cosine.
-
-### State Vector ($x_{aug}$)
-The solver uses an **augmented state vector** of dimension 6:
+### 1.1 Continuous Kinematic Model
+The robot is modeled as a standard unicycle (differential drive) system. The state vector is defined as $\mathbf{x} = [x, y, \theta]^\top$ and the control input as $\mathbf{u} = [v, \omega]^\top$.
 
 $$
-x_{aug} = \begin{bmatrix} 
-x \\ 
-y \\ 
-\sin(\theta) \\ 
-\cos(\theta) \\ 
-v_{prev} \\ 
-\omega_{prev} 
+\dot{x} = v \cos(\theta) \\
+\dot{y} = v \sin(\theta) \\
+\dot{\theta} = \omega
+$$
+
+### 1.2 Sin/Cos State Representation
+To avoid singularities associated with Euler angles (specifically the wrapping at $\pm \pi$), the orientation $\theta$ is embedded using its sine and cosine components. This maps the state space to $\mathbb{R}^4$:
+
+$$
+\mathbf{x}_{sc} = \begin{bmatrix} x \\ y \\ \sin(\theta) \\ \cos(\theta) \end{bmatrix}
+$$
+
+The derivatives are given by the chain rule:
+
+$$
+\dot{x} = v \cos(\theta) \\
+\dot{y} = v \sin(\theta) \\
+\dot{\sin(\theta)} = \cos(\theta) \cdot \omega \\
+\dot{\cos(\theta)} = -\sin(\theta) \cdot \omega
+$$
+
+*Note: The geometric constraint $\sin^2(\theta) + \cos^2(\theta) = 1$ is implicitly maintained by the cost function tracking a reference trajectory that satisfies it, but is not strictly enforced as a hard constraint in the QP to maintain convexity.*
+
+## 2. Linearization and Discretization
+
+The non-linear dynamics $\dot{\mathbf{x}}_{sc} = f(\mathbf{x}_{sc}, \mathbf{u})$ are linearized around a reference operating point. We use the **current measured velocity** $\mathbf{u}_{ref} = [v_{ref}, \omega_{ref}]^\top$ and the reference trajectory orientation for linearization.
+
+### 2.1 Jacobian Derivation
+The Jacobian matrices $A_c = \frac{\partial f}{\partial \mathbf{x}}$ and $B_c = \frac{\partial f}{\partial \mathbf{u}}$ are:
+
+$$
+A_c = \begin{bmatrix} 
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & \omega_{ref} \\
+0 & 0 & -\omega_{ref} & 0
+\end{bmatrix}, \quad
+B_c = \begin{bmatrix} 
+\cos(\theta_{ref}) & 0 \\
+\sin(\theta_{ref}) & 0 \\
+0 & \cos(\theta_{ref}) \\
+0 & -\sin(\theta_{ref})
 \end{bmatrix}
 $$
 
-- $x, y$: Robot position in map frame.
-- $\sin(\theta), \cos(\theta)$: Orientation components.
-- $v_{prev}, \omega_{prev}$: Control inputs applied at the *previous* step.
-
-### Control Vector ($\Delta u$)
-The optimizer solves for **control increments** (dimension 2), not absolute velocities:
+### 2.2 Discretization (Euler Forward)
+For a sampling time $T_s$, the discrete-time matrices $A_d \approx I + A_c T_s$ and $B_d \approx B_c T_s$ are:
 
 $$
-\Delta u = \begin{bmatrix} 
-\Delta v \\ 
-\Delta \omega 
-\end{bmatrix}
+A_d = \begin{bmatrix} 
+1 & 0 & 0 & 0 \\
+1 & 0 & 0 & 0 \\
+0 & 0 & 1 & 0 \\
+0 & 0 & 0 & 1
+\end{bmatrix} + T_s \cdot \text{CouplingTerms}^*
 $$
 
-This formulation forces the cost function to penalize *changes* in velocity (acceleration/jerk), promoting smoothness.
+*\*Note: In the implementation, we approximate the coupling of linear velocity to position using the reference orientation components.*
 
-## 2. Differential Drive Dynamics
+**Singularity Avoidance at Low Speed**:
+When $v_{meas} \approx 0$, the Jacobian terms relating $\theta$ to $x,y$ vanish, rendering the system uncontrollable in the solver's view. To preserve rank and steerability, we impose a lower bound on the linearization velocity:
+$$ v_{ref}^* = \text{sgn}(v_{ref}) \cdot \max(|v_{ref}|, 0.01 \text{ m/s}) $$
 
-The continuous kinematic model is:
+## 3. Augmented Formulation (Velocity Increments)
 
+To penalize control smoothness (jerk/acceleration minimization) rather than absolute control effort, the system is augmented to include the previous control input $\mathbf{u}_{k-1}$ as part of the state.
+
+### 3.1 Augmented State Vector
 $$
-\begin{align}
-\dot{x} &= v \cos \theta \\
-\dot{y} &= v \sin \theta \\
-\dot{\sin \theta} &= \cos \theta \cdot \omega \\
-\dot{\cos \theta} &= -\sin \theta \cdot \omega
-\end{align}
-$$
-
-### Linearization
-The MPC linearizes this model around the **current robot velocity** ($u_{ref}$).
-*Crucially*, if the robot is stopped ($v \approx 0$), the model would lose steerability (changing $\theta$ wouldn't affect $x, y$). To prevent this, we enforce a minimum linearization velocity:
-$$ |v_{ref}| = \max(|v_{measured}|, 0.1) $$
-
-The discrete linearized matrices $A_d$ (4x4) and $B_d$ (4x2) are derived using Euler forward integration:
-
-$$
-x_{k+1} \approx A_d x_k + B_d u_k
+\mathbf{\xi}_k = \begin{bmatrix} \mathbf{x}_k \\ \mathbf{u}_{k-1} \end{bmatrix} \in \mathbb{R}^6
 $$
 
-Where terms like $\Delta x \approx v_{ref} \cos(\theta_{ref}) \Delta t$ appear in $A_d$ and terms like $\Delta x \approx \cos(\theta_{ref}) \Delta t \Delta v$ appear in $B_d$.
-
-### Augmented Dynamics
-To optimize increments $\Delta u$, we augment the system:
-
+### 3.2 Optimization Variable
+The solver optimizes the **control increments**:
 $$
-\begin{bmatrix} x_{k+1} \\ u_k \end{bmatrix} = 
-\begin{bmatrix} A_d & B_d \\ 0 & I \end{bmatrix} 
-\begin{bmatrix} x_k \\ u_{k-1} \end{bmatrix} + 
-\begin{bmatrix} B_d \\ I \end{bmatrix} \Delta u_k
+\Delta \mathbf{u}_k = \mathbf{u}_k - \mathbf{u}_{k-1}
 $$
 
-This is the standard form $X_{k+1} = A_{aug} X_k + B_{aug} \Delta U_k$.
-
-## 3. Optimization Problem (OSQP)
-
-We solve the following Quadratic Program (QP) at 10Hz:
+### 3.3 Augmented State-Space Model
+The dynamics for $\mathbf{\xi}_{k+1}$ become:
 
 $$
-\min_{\Delta U} \sum_{k=0}^{N_p} \| x_k - x_{ref,k} \|^2_Q + \sum_{k=0}^{N_c} \| \Delta u_k \|^2_{R_d}
+\begin{bmatrix} \mathbf{x}_{k+1} \\ \mathbf{u}_k \end{bmatrix} = 
+\underbrace{\begin{bmatrix} A_d & B_d \\ 0_{2\times4} & I_{2\times2} \end{bmatrix}}_{\mathcal{A}}
+\begin{bmatrix} \mathbf{x}_k \\ \mathbf{u}_{k-1} \end{bmatrix} + 
+\underbrace{\begin{bmatrix} B_d \\ I_{2\times2} \end{bmatrix}}_{\mathcal{B}}
+\Delta \mathbf{u}_k
 $$
 
-### Constraints
-1.  **Dynamics**: Enforced via the prediction matrices $S_x, S_u$.
-2.  **Control Limits (Box)**:
-    - Acceleration bounds: $\Delta u_{min} \le \Delta u \le \Delta u_{max}$
-    - Velocity bounds: Implemented dynamically by clipping the acceleration bounds based on current velocity.
+## 4. Optimization Problem (QP)
 
-### Implicit Geometric Constraint
-$$ \sin^2(\theta) + \cos^2(\theta) = 1 $$
-**Usage Note**: This quadratic equality constraint is **NOT enforced** by the OSQP solver (which only handles linear constraints).
-- **Consequence**: The state vector can technically drift off the unit circle.
-- **Mitigation**: The MPC re-plans every 100ms. The predicted horizon is short enough that drift is negligible. The reference trajectory itself is on the unit circle, creating a "soft" constraint via the $Q$ matrix.
+We solve the following Finite Horizon Optimal Control problem at each step $k$:
 
-## 4. Implementation Details
+$$
+\min_{\Delta \mathbf{U}} \quad \sum_{i=0}^{N_p} \| \mathbf{C}\mathbf{\xi}_{k+i} - \mathbf{r}_{k+i} \|^2_Q + \sum_{j=0}^{N_c-1} \| \Delta \mathbf{u}_{k+j} \|^2_{R_d}
+$$
 
-- **Upper Triangular P**: OSQP requires the cost matrix $P$ to be upper triangular. The code explicitly filters the Eigen matrix to remove the lower triangular part before passing it to the C API.
-- **Reference Generation**:
-    - The controller receives a path with timestamps.
-    - `get_reference_trajectory_horizon` interpolates this path to find exactly where the robot *should* be at $t, t+\Delta t, t+2\Delta t...$
-    - This allows for "Time Constrained" behavior: if the robot is late, the reference is ahead, creating a larger error term that drives higher velocities.
+**Subject to:**
+1.  **System Dynamics**: $\mathbf{\xi}_{k+i+1} = \mathcal{A}\mathbf{\xi}_{k+i} + \mathcal{B}\Delta \mathbf{u}_{k+i}$
+2.  **Input Constraints** (Velocity & Acceleration):
+    $$
+    \mathbf{u}_{min} \leq \mathbf{u}_{k-1} + \sum_{j=0}^{i} \Delta \mathbf{u}_{k+j} \leq \mathbf{u}_{max}
+    $$
+    $$
+    \Delta \mathbf{u}_{min} \leq \Delta \mathbf{u}_{k+i} \leq \Delta \mathbf{u}_{max}
+    $$
+
+### 4.1 Solver Implementation (OSQP)
+*   **Hessian ($P$) Construction**: The dense Hessian $P = S_u^\top \bar{Q} S_u + \bar{R}$ is computed using Eigen.
+*   **Triangular Filtering**: OSQP requires only the upper triangular part of $P$. The implementation explicitly filters these entries to ensure numerical stability.
+*   **Constraint Handling**: Box constraints on $\Delta \mathbf{u}$ are dynamically adjusted based on the current accumulated velocity $\mathbf{u}_{prev}$ to enforce absolute velocity limits effectively:
+    $$ \Delta u_{max}^{step} = \min(a_{max} \cdot T_s, \quad v_{max} - u_{prev}) $$
+

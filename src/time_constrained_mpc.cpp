@@ -9,10 +9,10 @@ namespace mpc_controller
 MPCController::MPCController()
 : rclcpp_lifecycle::LifecycleNode("mpc_controller")
 {
-  // Initialize bond ID to match what Nav2 lifecycle manager expects
+  // Initialize bond ID to match Nav2 lifecycle manager expectations
   bond_id_ = get_name();
   
-  // Initialize logger
+  // Initialize logger instance
   mpc_logger_ = std::make_unique<MPCLogger>();
 }
 
@@ -321,7 +321,13 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   
   // Store new goal
   current_goal_handle_ = goal_handle;
-  du_prev_ = Eigen::Vector2d::Zero();
+
+  // Initialize previous control to current robot velocity.
+  // This ensures smooth transitions if the robot is already moving.
+  // We clamp it to configured limits for safety.
+  auto current_vel = get_robot_velocity();
+  u_prev_(0) = std::clamp(current_vel.linear.x, 0.0, max_linear_vel_);
+  u_prev_(1) = std::clamp(current_vel.angular.z, -max_angular_vel_, max_angular_vel_);
   
   // Record when path execution starts
   path_start_time_ = this->now();
@@ -887,26 +893,30 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
   solve_time_ms = 0.0;
 
   // 1. Build QP matrices
-  // States: x, y, s_theta, c_theta, u_prev_v, u_prev_w (dim=6)
-  // Controls: dv, dw (dim=2)
+  // --------------------------------------------------------
+  // State Vector:   x = [x, y, sin(theta), cos(theta)]^T
+  // Control Vector: u = [v, omega]^T
+  // Augmented State: xi = [x^T, u_{k-1}^T]^T
+  // --------------------------------------------------------
+  
   Eigen::Vector4d current_state;
   current_state << pose.pose.position.x, pose.pose.position.y,
                    std::sin(tf2::getYaw(pose.pose.orientation)),
                    std::cos(tf2::getYaw(pose.pose.orientation));
                    
-  // We need the reference control for the first step
-
-  // Using current robot velocity for linearization
+  // Linearization Point
+  // We linearize non-linear dynamics around the current robot velocity.
   Eigen::Vector2d u_ref;
   u_ref(0) = vel.linear.x;
   u_ref(1) = vel.angular.z;
   
-  // Ensure non-zero linearization velocity to maintain orientation-position coupling
-  // even when stopped. This allows the solver to see that turning affects position.
-  // Using a small value (0.01) to minimize "phantom drift" in the prediction model
-  // while ensuring the A-matrix terms are non-zero.
-  if (std::abs(u_ref(0)) < 0.01) {
-    u_ref(0) = (u_ref(0) >= 0) ? 0.01 : -0.01;
+  // Singularity Avoidance:
+  // When v approx 0, the Jacobian terms coupling orientation to position vanish.
+  // We impose a minimum linearization velocity (|v| >= 0.01 m/s) to ensure the
+  // solver acknowledges that orientation changes affect the spatial state.
+  constexpr double MIN_LINEARIZATION_VEL = 0.01;
+  if (std::abs(u_ref(0)) < MIN_LINEARIZATION_VEL) {
+    u_ref(0) = (u_ref(0) >= 0) ? MIN_LINEARIZATION_VEL : -MIN_LINEARIZATION_VEL;
   }
   if (reference_trajectory.size() > 1) {
     // Estimate from trajectory... for now assume 0 or last command
@@ -999,143 +1009,99 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
     // 5. Extract solution
     if (solver->info->status_val == OSQP_SOLVED || 
         solver->info->status_val == OSQP_SOLVED_INACCURATE) {
-      // First control input: [v, w]
-      // The solution vector x contains [x_0, u_0, x_1, u_1, ...] or similar depending on formulation.
-      // In our formulation (check build_mpc_matrices), the variables are usually ordered u_0, u_1... ??
-      // Wait, build_mpc_matrices defines the order.
-      // Usually standard dense/sparse form: z = [u, x] or similar.
-      // Assuming the vector 'x' (solution) starts with control inputs for the first step.
-      // Let's verify standard condensed/sparse MPC. 
-      // If we use sparse formulation with state and control variables:
-      // z = [u_0; x_1; u_1; x_2; ... ]
-      // The first 2 elements are u_0 (delta_v, delta_w).
-      
-      // Let's assume the first 2 vars are the control increments.
+      // Extract optimal control increments
       double delta_v = solver->solution->x[0];
       double delta_w = solver->solution->x[1];
       
-      // Update actual control
-      // We apply delta to previous APPLIED command? 
-      // OR we integrate it?
-      // Our state has u_prev.
-      // The output we want is absolute velocity.
-      
-      // u_k = u_{k-1} + delta_u_k
-      double u_v = du_prev_(0) + delta_v;
-      double u_w = du_prev_(1) + delta_w;
+      // Update persistent execution state (u_{k-1})
+      // But first, save u_{k-1} for prediction start
+      double v_last_cmd = u_prev_(0);
+      double w_last_cmd = u_prev_(1);
+
+      // Current control: u_k = u_{k-1} + \Delta u_k
+      double u_v = v_last_cmd + delta_v;
+      double u_w = w_last_cmd + delta_w;
       
       // Update state for next step
-      du_prev_(0) = u_v;
-      du_prev_(1) = u_w;
+      u_prev_(0) = u_v;
+      u_prev_(1) = u_w;
       
+      // Saturate commands for safety
       cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
       cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
       
-      // === PREDICTION FOR DEBUGGING ===
-      // Extract predicted trajectory from solver solution
-      // The vector x layout depends on build_mpc_matrices. 
-      // Assuming z = [u0, x1, u1, x2, ...] layout (common in sparse OCP)
-      // dim(u) = 2, dim(x) = 6 (augmented)
-      // z index: 0,1 (u0); 2..7 (x1); 8,9 (u1); 10..15 (x2)...
+      // === FORWARD SIMULATION (Prediction) ===
+      // Reconstruct the predicted trajectory from the optimal control increments.
+      // This is used for both logging and visual debugging.
+      last_predicted_states_.clear();
+      last_predicted_states_.reserve(prediction_horizon_steps_);
       
+      // Simulation variables
+      double x_sim = current_state(0);
+      double y_sim = current_state(1);
+      double s_sim = current_state(2);
+      double c_sim = current_state(3);
+      double v_sim = v_last_cmd;
+      double w_sim = w_last_cmd;
+      
+      for (int k = 0; k < prediction_horizon_steps_; ++k) {
+        // Apply control increment for step k
+        if (k < control_horizon_steps_) {
+           v_sim += solver->solution->x[2*k];
+           w_sim += solver->solution->x[2*k + 1];
+           
+           // Saturate predicted velocity to match robot constraints.
+           // This prevents the visualization from showing "backward" paths (negative velocity)
+           // when the real robot is clamped to 0.
+           v_sim = std::clamp(v_sim, 0.0, max_linear_vel_);
+           w_sim = std::clamp(w_sim, -max_angular_vel_, max_angular_vel_);
+        }
+        
+        // Integrate Dynamics (Euler Forward)
+        x_sim += v_sim * c_sim * d_t_;
+        y_sim += v_sim * s_sim * d_t_;
+        double s_next = s_sim + c_sim * w_sim * d_t_;
+        double c_next = c_sim - s_sim * w_sim * d_t_;
+        
+        // Normalize orientation vector to prevent numerical drift
+        double norm = std::hypot(s_next, c_next);
+        if (norm > 1e-6) {
+          s_sim = s_next / norm;
+          c_sim = c_next / norm;
+        } else {
+          s_sim = s_next;
+          c_sim = c_next;
+        }
+        
+        // Store
+        last_predicted_states_.push_back(Eigen::Vector4d(x_sim, y_sim, s_sim, c_sim));
+      }
+      
+      // Visual Debugging
       if (debug_mpc_) {
         nav_msgs::msg::Path predicted_path;
         predicted_path.header.frame_id = map_frame_;
         predicted_path.header.stamp = this->now();
-        
-        // Add current pose
-        predicted_path.poses.push_back(pose);
-        
-        int state_dim = 6;
-        int control_dim = 2;
-        int step_size = state_dim + control_dim;
-        
-        last_predicted_states_.clear();
-        
-        for (int k = 0; k < prediction_horizon_steps_; ++k) {
-          int offset = control_dim + k * step_size; // Start of x_{k+1}
-          if (offset + 3 >= n_vars) break;
-          
-          double x_pred = solver->solution->x[offset + 0];
-          double y_pred = solver->solution->x[offset + 1];
-          double s_theta_pred = solver->solution->x[offset + 2];
-          double c_theta_pred = solver->solution->x[offset + 3];
-          
-          // Store for logging
-          last_predicted_states_.push_back(Eigen::Vector4d(x_pred, y_pred, s_theta_pred, c_theta_pred));
-          
-          double theta_pred = std::atan2(s_theta_pred, c_theta_pred);
-          
+        predicted_path.poses.reserve(prediction_horizon_steps_ + 1);
+        predicted_path.poses.push_back(pose); // Add start pose
+
+        for (const auto& state : last_predicted_states_) {
           geometry_msgs::msg::PoseStamped p;
           p.header = predicted_path.header;
-          p.pose.position.x = x_pred;
-          p.pose.position.y = y_pred;
+          p.pose.position.x = state(0);
+          p.pose.position.y = state(1);
           p.pose.position.z = 0.0;
+          
           tf2::Quaternion q;
-          q.setRPY(0, 0, theta_pred);
+          q.setRPY(0, 0, std::atan2(state(2), state(3)));
           p.pose.orientation = tf2::toMsg(q);
           
           predicted_path.poses.push_back(p);
         }
+        
         predicted_path_pub_->publish(predicted_path);
       }
-      
-      // Store predicted states for logging (always, even if debug is off)
-      last_predicted_states_.clear();
-      // Re-calculate prediction for logging if debug was off, or just use the loop above?
-      // To avoid code duplication and overhead, let's just do the prediction loop once.
-      // We will refactor the prediction loop to populate last_predicted_states_
-      
-      // Reset state for prediction
-      double x_pred = current_state(0);
-      double y_pred = current_state(1);
-      double s_theta_pred = current_state(2);
-      double c_theta_pred = current_state(3);
-      double v_pred = u_ref(0) + du_prev_(0); // Reset to initial condition
-      double w_pred = u_ref(1) + du_prev_(1);
-      
-      // Note: du_prev_ was already updated with delta_v/w above, so we need to be careful.
-      // Actually, du_prev_ is updated at lines 945-946.
-      // The prediction loop at 966 uses work->solution->x which are DELTAS.
-      // So we need to start from the state BEFORE the current update? 
-      // No, the prediction starts from current_state.
-      // The controls applied are u_0, u_1...
-      // u_0 = u_ref + du_prev_old + delta_u_0
-      // But du_prev_ is now u_ref + du_prev_old + delta_u_0 - u_ref = du_prev_new
-      // Wait, let's look at 945: du_prev_(0) += delta_v;
-      // So du_prev_ now contains the accumulated control for step 0.
-      
-      // Let's just reconstruct the states for logging.
-      // We need to subtract the current delta to get back to "previous" for the loop?
-      // Or just use the loop logic correctly.
-      
-      // Re-initialize for logging loop
-      v_pred = u_ref(0) + du_prev_(0) - delta_v; // Back to u_{-1}
-      w_pred = u_ref(1) + du_prev_(1) - delta_w;
-      
-      last_predicted_states_.reserve(prediction_horizon_steps_);
-      
-      for (int i = 0; i < prediction_horizon_steps_; ++i) {
-         // Update velocity
-          if (i < control_horizon_steps_) {
-            v_pred += solver->solution->x[2*i];
-            w_pred += solver->solution->x[2*i + 1];
-          }
-         
-         // Integrate
-         x_pred += v_pred * c_theta_pred * d_t_;
-         y_pred += v_pred * s_theta_pred * d_t_;
-         s_theta_pred += c_theta_pred * w_pred * d_t_;
-         c_theta_pred += -s_theta_pred * w_pred * d_t_;
-         
-         Eigen::Vector4d state;
-         state << x_pred, y_pred, s_theta_pred, c_theta_pred;
-         last_predicted_states_.push_back(state);
-      }
-  // Saturate controls as safety measure
-      // (Should not be necessary if constraints are properly set, but kept as failsafe)
-      cmd.linear.x = std::clamp(u_v, 0.0, max_linear_vel_);
-      cmd.angular.z = std::clamp(u_w, -max_angular_vel_, max_angular_vel_);
+
     } else {
       RCLCPP_WARN(get_logger(), "MPC solver failed with status: %lld", 
                   solver->info ? (long long)solver->info->status_val : -1);
@@ -1231,7 +1197,7 @@ void MPCController::reset_state()
   }
   
   global_plan_.poses.clear();
-  du_prev_ = Eigen::Vector2d::Zero();
+  u_prev_ = Eigen::Vector2d::Zero();
   current_goal_handle_.reset();
   initial_rotation_completed_ = false;
   
@@ -1375,7 +1341,7 @@ void MPCController::build_mpc_matrices(
   // Augmented state vector (initial state)
   Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(dim_aug);
   x_aug.head(dim_x) = current_state;
-  x_aug.tail(dim_u) = du_prev_;  // Previous velocity (u_ref is for linearization only)
+  x_aug.tail(dim_u) = u_prev_;  // Previous velocity command (u_{k-1})
   
   // P matrix (Hessian)
   // Cost: ||x_i - x_ref||²_Q + ||Δu_i||²_{R_d}
@@ -1400,9 +1366,13 @@ void MPCController::build_mpc_matrices(
   }
   A.setFromTriplets(triplets.begin(), triplets.end());
   
-  // Calculate current accumulated velocities
-  double v_current = u_ref(0) + du_prev_(0);
-  double w_current = u_ref(1) + du_prev_(1);
+  // Current State for Constraint Generation
+  // u_prev_ stores the absolute command from the previous step.
+  // Constraints are applied to delta_u:
+  //      u_min <= u_prev + delta_u <= u_max
+  //  =>  u_min - u_prev <= delta_u <= u_max - u_prev
+  double v_current = u_prev_(0);
+  double w_current = u_prev_(1);
   
   // Set constraint bounds for each step in the control horizon
   for (int i = 0; i < Nc; ++i) {
