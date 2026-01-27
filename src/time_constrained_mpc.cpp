@@ -338,7 +338,11 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   auto interpolated_path = interpolate_path(original_path, 0.1);  // 10cm spacing
   
   // Then smooth the interpolated path to handle sharp corners
-  global_plan_ = smooth_path(interpolated_path, path_smoothing_window_);
+  auto smoothed_path = smooth_path(interpolated_path, path_smoothing_window_);
+  
+  // Resample and retime the smoothed path to ensure uniform spatial distribution
+  // and smooth velocity profile, avoiding bunching at start/end
+  global_plan_ = resample_and_retime_path(interpolated_path, smoothed_path, 0.1);
   
   initial_rotation_completed_ = false;  // Reset rotation flag
   
@@ -720,6 +724,127 @@ nav_msgs::msg::Path MPCController::smooth_path(const nav_msgs::msg::Path &origin
               original_path.poses.size(), smoothed_path.poses.size());
   
   return smoothed_path;
+}
+
+// ----- PATH RESAMPLING AND RETIMING -----
+nav_msgs::msg::Path MPCController::resample_and_retime_path(const nav_msgs::msg::Path &interpolated_path,
+                                                             const nav_msgs::msg::Path &smoothed_path,
+                                                             double spacing)
+{
+  if (smoothed_path.poses.size() < 2 || interpolated_path.poses.size() < 2) {
+    return smoothed_path;
+  }
+
+  RCLCPP_INFO(get_logger(), "Resampling and retiming path with spacing: %.2fm", spacing);
+
+  // 1. Build Distance -> Time lookup from interpolated_path (source of truth for time)
+  std::vector<double> orig_dists;
+  std::vector<double> orig_times;
+  orig_dists.push_back(0.0);
+  
+  rclcpp::Time t0(interpolated_path.poses.front().header.stamp);
+  orig_times.push_back(0.0); // Relative time
+  
+  for (size_t i = 0; i < interpolated_path.poses.size() - 1; ++i) {
+    double dx = interpolated_path.poses[i+1].pose.position.x - interpolated_path.poses[i].pose.position.x;
+    double dy = interpolated_path.poses[i+1].pose.position.y - interpolated_path.poses[i].pose.position.y;
+    double d = std::hypot(dx, dy);
+    orig_dists.push_back(orig_dists.back() + d);
+    
+    rclcpp::Time ti(interpolated_path.poses[i+1].header.stamp);
+    orig_times.push_back((ti - t0).seconds());
+  }
+  
+  double total_orig_dist = orig_dists.back();
+  
+  // 2. Calculate total length of smoothed_path (geometry)
+  std::vector<double> smooth_dists;
+  smooth_dists.push_back(0.0);
+  for (size_t i = 0; i < smoothed_path.poses.size() - 1; ++i) {
+    double dx = smoothed_path.poses[i+1].pose.position.x - smoothed_path.poses[i].pose.position.x;
+    double dy = smoothed_path.poses[i+1].pose.position.y - smoothed_path.poses[i].pose.position.y;
+    double d = std::hypot(dx, dy);
+    smooth_dists.push_back(smooth_dists.back() + d);
+  }
+  double total_smooth_dist = smooth_dists.back();
+  
+  // 3. Resample smoothed path at fixed spacing
+  nav_msgs::msg::Path final_path;
+  final_path.header = smoothed_path.header;
+  
+  // Add start point exactly
+  final_path.poses.push_back(smoothed_path.poses.front());
+  final_path.poses.back().header.stamp = interpolated_path.poses.front().header.stamp;
+  
+  double current_dist = spacing;
+  size_t current_idx = 0; // Index in smoothed_path
+  
+  while (current_dist < total_smooth_dist) {
+    // Find segment in smoothed_path
+    while (current_idx < smooth_dists.size() - 1 && smooth_dists[current_idx+1] < current_dist) {
+      current_idx++;
+    }
+    
+    if (current_idx >= smoothed_path.poses.size() - 1) break;
+    
+    // Interpolate geometry
+    double seg_start_dist = smooth_dists[current_idx];
+    double seg_end_dist = smooth_dists[current_idx+1];
+    double seg_len = seg_end_dist - seg_start_dist;
+    
+    double ratio = 0.0;
+    if (seg_len > 1e-6) {
+      ratio = (current_dist - seg_start_dist) / seg_len;
+    }
+    
+    const auto &p1 = smoothed_path.poses[current_idx];
+    const auto &p2 = smoothed_path.poses[current_idx+1];
+    
+    geometry_msgs::msg::PoseStamped new_pose;
+    new_pose.header = smoothed_path.header;
+    new_pose.pose.position.x = p1.pose.position.x + ratio * (p2.pose.position.x - p1.pose.position.x);
+    new_pose.pose.position.y = p1.pose.position.y + ratio * (p2.pose.position.y - p1.pose.position.y);
+    new_pose.pose.position.z = p1.pose.position.z; // Keep Z
+    
+    // Calculate Orientation (Tangent)
+    double tangent_theta = std::atan2(p2.pose.position.y - p1.pose.position.y,
+                                      p2.pose.position.x - p1.pose.position.x);
+    tf2::Quaternion q;
+    q.setRPY(0, 0, tangent_theta);
+    new_pose.pose.orientation = tf2::toMsg(q);
+    
+    // Map Distance to Time
+    // Normalize distance to [0, 1] relative to smoothed total length
+    // Then map to original total length to look up time
+    // This assumes uniform stretching/shrinking of the path geometry
+    double normalized_dist = current_dist / total_smooth_dist;
+    double lookup_dist = normalized_dist * total_orig_dist;
+    
+    // Lookup time in orig_dists/orig_times
+    auto it = std::lower_bound(orig_dists.begin(), orig_dists.end(), lookup_dist);
+    size_t t_idx = std::distance(orig_dists.begin(), it);
+    if (t_idx == 0) t_idx = 1;
+    if (t_idx >= orig_dists.size()) t_idx = orig_dists.size() - 1;
+    
+    double t_ratio = (lookup_dist - orig_dists[t_idx-1]) / (orig_dists[t_idx] - orig_dists[t_idx-1]);
+    double relative_time = orig_times[t_idx-1] + t_ratio * (orig_times[t_idx] - orig_times[t_idx-1]);
+    
+    new_pose.header.stamp = static_cast<builtin_interfaces::msg::Time>(
+      t0 + rclcpp::Duration::from_seconds(relative_time));
+      
+    final_path.poses.push_back(new_pose);
+    
+    current_dist += spacing;
+  }
+  
+  // Add end point exactly
+  final_path.poses.push_back(smoothed_path.poses.back());
+  final_path.poses.back().header.stamp = interpolated_path.poses.back().header.stamp; // Exact end time
+  
+  RCLCPP_INFO(get_logger(), "Resampled path: %zu -> %zu poses",
+              smoothed_path.poses.size(), final_path.poses.size());
+              
+  return final_path;
 }
 
 // ----- TEMPORAL REFERENCE CALCULATION -----

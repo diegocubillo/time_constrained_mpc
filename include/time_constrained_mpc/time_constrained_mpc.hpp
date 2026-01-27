@@ -63,6 +63,9 @@ public:
                                         double target_spacing = 0.1);
   nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path &original_path,
                                    double smoothing_window = 0.5);
+  nav_msgs::msg::Path resample_and_retime_path(const nav_msgs::msg::Path &interpolated_path,
+                                                const nav_msgs::msg::Path &smoothed_path,
+                                                double spacing = 0.1);
   
   // Temporal reference calculation
   geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
