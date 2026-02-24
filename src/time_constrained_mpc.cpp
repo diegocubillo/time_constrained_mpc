@@ -322,6 +322,23 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   // Store new goal
   current_goal_handle_ = goal_handle;
 
+  // Check if the last pose of the original path has a valid explicit orientation.
+  // A default-constructed quaternion in ROS2 is (0,0,0,0) which is not normalized.
+  // If the quaternion is normalized (x²+y²+z²+w² ≈ 1), the goal has an explicit orientation.
+  has_goal_orientation_ = false;
+  if (!original_path.poses.empty()) {
+    const auto& goal_quat = original_path.poses.back().pose.orientation;
+    double norm_sq = goal_quat.x * goal_quat.x + goal_quat.y * goal_quat.y +
+                     goal_quat.z * goal_quat.z + goal_quat.w * goal_quat.w;
+    if (std::abs(norm_sq - 1.0) < 0.1 && norm_sq > 0.01) {
+      has_goal_orientation_ = true;
+      goal_orientation_ = goal_quat;
+      double goal_yaw = tf2::getYaw(goal_quat);
+      RCLCPP_INFO(get_logger(), "Goal has explicit orientation: yaw = %.2f rad (%.1f deg)",
+                  goal_yaw, goal_yaw * 180.0 / M_PI);
+    }
+  }
+
   // Initialize previous control to current robot velocity.
   // This ensures smooth transitions if the robot is already moving.
   // We clamp it to configured limits for safety.
@@ -344,7 +361,9 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   // and smooth velocity profile, avoiding bunching at start/end
   global_plan_ = resample_and_retime_path(interpolated_path, smoothed_path, 0.1);
   
-  initial_rotation_completed_ = false;  // Reset rotation flag
+
+  
+  control_phase_ = ControlPhase::INITIAL_ROTATION;  // Reset control phase
   
   // Validate that all timestamps are in the future
   if (!global_plan_.poses.empty()) {
@@ -407,11 +426,11 @@ void MPCController::control_loop()
   // Calculate temporal error only for monitoring
   calculate_temporal_error(pose, current_time);
 
-  // ----- SIMPLE ANGLE CONTROL (Start Only) -----
-  // Check if we need to rotate in place before running MPC
-  if (!global_plan_.poses.empty() && !initial_rotation_completed_) {
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Rotating in place to align with path");
-    // Determine target orientation (first point of the plan)
+  switch (control_phase_) {
+
+  // ===== PHASE 1: INITIAL ROTATION =====
+  // Rotate in place to align with the first point of the path
+  case ControlPhase::INITIAL_ROTATION: {
     double target_yaw = tf2::getYaw(global_plan_.poses.front().pose.orientation);
     double current_yaw = tf2::getYaw(pose.pose.orientation);
     double angle_error = target_yaw - current_yaw;
@@ -420,105 +439,113 @@ void MPCController::control_loop()
     while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
     while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
 
-      // If error is significant, rotate in place
-      if (std::abs(angle_error) > goal_theta_tolerance_) {
-        geometry_msgs::msg::Twist rotate_cmd;
-        rotate_cmd.linear.x = 0.0;
-        
-        // Constant velocity control for fast initial alignment
-        // Use 50% of max angular velocity in the direction of the error
-        double direction = (angle_error > 0) ? 1.0 : -1.0;
-        rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
-        
-        publish_velocity_command(rotate_cmd);
-      
-      // Update feedback and return (skip MPC)
+    if (std::abs(angle_error) > goal_theta_tolerance_) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Phase INITIAL_ROTATION: aligning with path (error: %.2f rad)", angle_error);
+
+      geometry_msgs::msg::Twist rotate_cmd;
+      rotate_cmd.linear.x = 0.0;
+      double direction = (angle_error > 0) ? 1.0 : -1.0;
+      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+
+      publish_velocity_command(rotate_cmd);
       update_feedback(pose);
       return;
-    } else {
-      // Angle is good, mark as completed and proceed to MPC
-      initial_rotation_completed_ = true;
-      RCLCPP_INFO(get_logger(), "Initial rotation completed. Switching to MPC.");
     }
+
+    // Initial rotation done → transition to PATH_FOLLOWING
+    RCLCPP_INFO(get_logger(), "Initial rotation completed. Switching to PATH_FOLLOWING.");
+    control_phase_ = ControlPhase::PATH_FOLLOWING;
+    // Fall through to PATH_FOLLOWING immediately
+    [[fallthrough]];
   }
 
-  // ----- SIMPLE ANGLE CONTROL (End Only) -----
-  // Check if we are at the end and need to align orientation 
-  if (!global_plan_.poses.empty()) {
-    double dist_to_goal = std::hypot(
-      global_plan_.poses.back().pose.position.x - pose.pose.position.x,
-      global_plan_.poses.back().pose.position.y - pose.pose.position.y);
+  // ===== PHASE 2: PATH FOLLOWING (MPC) =====
+  // MPC tracks the path. Goal is reached when position + time are met.
+  // Orientation is NOT checked here — it will be handled by FINAL_ROTATION.
+  case ControlPhase::PATH_FOLLOWING: {
+    // Get reference trajectory for the MPC horizon based on current time
+    auto reference_trajectory = get_reference_trajectory_horizon(current_time, prediction_horizon_steps_, d_t_);
 
-    // Check if we are close to goal AND time has reached the end of the path
-    rclcpp::Time last_path_time(global_plan_.poses.back().header.stamp);
-    bool time_reached = current_time >= last_path_time;
+    // Solve MPC with temporal references
+    double solve_time_ms = 0.0;
+    auto cmd = solve_mpc(pose, velocity, reference_trajectory, solve_time_ms);
 
-    if (dist_to_goal < goal_dist_tolerance_ && time_reached) {
-      double target_yaw = tf2::getYaw(global_plan_.poses.back().pose.orientation);
-      double current_yaw = tf2::getYaw(pose.pose.orientation);
-      double angle_error = target_yaw - current_yaw;
+    // Publish command
+    publish_velocity_command(cmd);
 
-      // Normalize angle error to [-pi, pi]
-      while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
-      while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
+    // Log data
+    if (initialized_ && !global_plan_.poses.empty()) {
+      auto ref_pose = get_temporal_reference(current_time);
 
-      if (std::abs(angle_error) > goal_theta_tolerance_) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Rotating in place to align with goal");
-        
-        geometry_msgs::msg::Twist rotate_cmd;
-        rotate_cmd.linear.x = 0.0;
-        
-        // Constant velocity control
-        double direction = (angle_error > 0) ? 1.0 : -1.0;
-        rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
-        
-        publish_velocity_command(rotate_cmd);
-        update_feedback(pose);
-        return;
+      double dx = ref_pose.pose.position.x - pose.pose.position.x;
+      double dy = ref_pose.pose.position.y - pose.pose.position.y;
+      double spatial_error = std::hypot(dx, dy);
+
+      mpc_logger_->log(
+        current_time.seconds(),
+        pose,
+        ref_pose,
+        spatial_error,
+        cmd,
+        solve_time_ms,
+        last_predicted_states_
+      );
+    }
+
+    // Publish debug path
+    path_pub_->publish(global_plan_);
+
+    // Update feedback
+    update_feedback(pose);
+
+    // Check if position + time goal is reached (ignoring orientation)
+    if (goal_reached(pose, global_plan_)) {
+      if (has_goal_orientation_) {
+        // Transition to FINAL_ROTATION
+        RCLCPP_INFO(get_logger(), "Position goal reached. Switching to FINAL_ROTATION.");
+        control_phase_ = ControlPhase::FINAL_ROTATION;
+      } else {
+        // No goal orientation — we're done
+        reset_state();
       }
     }
-  }
-  
-  // Get reference trajectory for the MPC horizon based on current time
-  auto reference_trajectory = get_reference_trajectory_horizon(current_time, prediction_horizon_steps_, d_t_);
-  
-  // Solve MPC with temporal references
-  double solve_time_ms = 0.0;
-  auto cmd = solve_mpc(pose, velocity, reference_trajectory, solve_time_ms);
-
-  // Publish command
-  publish_velocity_command(cmd);
-
-  // Log data
-  if (initialized_ && !global_plan_.poses.empty()) {
-    auto ref_pose = get_temporal_reference(current_time);
-    
-    // Calculate spatial error to reference
-    double dx = ref_pose.pose.position.x - pose.pose.position.x;
-    double dy = ref_pose.pose.position.y - pose.pose.position.y;
-    double spatial_error = std::hypot(dx, dy);
-    
-    mpc_logger_->log(
-      current_time.seconds(),
-      pose,
-      ref_pose,
-      spatial_error,
-      cmd,
-      solve_time_ms,
-      last_predicted_states_
-    );
+    return;
   }
 
-  // Publish debug path (optional)
-  path_pub_->publish(global_plan_);
+  // ===== PHASE 3: FINAL ROTATION =====
+  // Rotate in place to align with the goal orientation.
+  // This only runs when has_goal_orientation_ is true.
+  case ControlPhase::FINAL_ROTATION: {
+    double target_yaw = tf2::getYaw(goal_orientation_);
+    double current_yaw = tf2::getYaw(pose.pose.orientation);
+    double angle_error = target_yaw - current_yaw;
 
-  // Update feedback to action (stub)
-  update_feedback(pose);
+    // Normalize angle error to [-pi, pi]
+    while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
+    while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
 
-  // Check goal reached
-  if (goal_reached(pose, global_plan_)) {
+    if (std::abs(angle_error) > goal_theta_tolerance_) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Phase FINAL_ROTATION: aligning with goal orientation (error: %.2f rad)", angle_error);
+
+      geometry_msgs::msg::Twist rotate_cmd;
+      rotate_cmd.linear.x = 0.0;
+      double direction = (angle_error > 0) ? 1.0 : -1.0;
+      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+
+      publish_velocity_command(rotate_cmd);
+      update_feedback(pose);
+      return;
+    }
+
+    // Final rotation done — goal fully achieved
+    RCLCPP_INFO(get_logger(), "Final rotation completed. Goal orientation reached.");
     reset_state();
+    return;
   }
+
+  } // end switch
 }
 
 // ----- ROBOT STATE -----
@@ -1300,7 +1327,10 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   double dist = std::hypot(dx, dy);
   
   // Check orientation difference
-  double goal_theta = tf2::getYaw(goal.pose.orientation);
+  // Use the explicit goal orientation if provided, otherwise use path tangent
+  double goal_theta = has_goal_orientation_ ?
+    tf2::getYaw(goal_orientation_) :
+    tf2::getYaw(goal.pose.orientation);
   double current_theta = tf2::getYaw(pose.pose.orientation);
   double theta_error = std::abs(std::atan2(std::sin(goal_theta - current_theta), 
                                            std::cos(goal_theta - current_theta)));
@@ -1310,6 +1340,13 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   rclcpp::Time last_path_time(goal.header.stamp);
   bool time_reached = current_time >= last_path_time;
   
+  // When has_goal_orientation_ is true, the FINAL_ROTATION phase handles orientation.
+  // Use a slightly relaxed distance tolerance (1.5x) for the position check because
+  // the MPC with discrete path spacing may not close the last few centimeters exactly.
+  // The FINAL_ROTATION phase will rotate in place at this "close enough" position.
+  if (has_goal_orientation_) {
+    return (dist < goal_dist_tolerance_ * 1.5) && time_reached;
+  }
   return (dist < goal_dist_tolerance_) && (theta_error < goal_theta_tolerance_) && time_reached;
 }
 
@@ -1324,7 +1361,8 @@ void MPCController::reset_state()
   global_plan_.poses.clear();
   u_prev_ = Eigen::Vector2d::Zero();
   current_goal_handle_.reset();
-  initial_rotation_completed_ = false;
+  control_phase_ = ControlPhase::INITIAL_ROTATION;
+  has_goal_orientation_ = false;
   
   // Stop the robot
   geometry_msgs::msg::Twist stop_cmd;

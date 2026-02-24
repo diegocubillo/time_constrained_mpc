@@ -200,6 +200,13 @@ class PathFollowerExample(Node):
             f'Time: {total_time:.2f}s, '
             f'Avg velocity: {avg_velocity:.2f}m/s')
 
+        # Override the last pose orientation to face positive x (yaw = 0)
+        # This tests the goal orientation preservation feature
+        path.poses[-1].pose.orientation.x = 0.0
+        path.poses[-1].pose.orientation.y = 0.0
+        path.poses[-1].pose.orientation.z = 0.0
+        path.poses[-1].pose.orientation.w = 1.0
+
         # Create goal
         goal_msg = FollowPath.Goal()
         goal_msg.path = path
