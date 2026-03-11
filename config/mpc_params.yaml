@@ -24,6 +24,9 @@ mpc_controller:
     # Enable MPC Debugging Output
     # debug_mpc: true
     
+    # Bond Settings
+    use_bond: true
+    
     # MPC Cost Weights
     # State tracking weights [x, y, sin(theta), cos(theta)]
     # High position weights to prioritize getting close to path

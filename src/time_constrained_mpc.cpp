@@ -15,9 +15,35 @@ MPCController::MPCController()
   
   // Initialize logger instance
   mpc_logger_ = std::make_unique<MPCLogger>();
+
+  // Declare parameters
+  this->declare_parameter<bool>("use_stamped_cmd_vel", false);
+  this->declare_parameter<bool>("debug_mpc", false);
+  this->declare_parameter<double>("max_linear_vel", 0.5);
+  this->declare_parameter<double>("max_angular_vel", 1.0);
+  this->declare_parameter<double>("max_linear_accel", 0.2);
+  this->declare_parameter<double>("max_angular_accel", 0.3);
+  this->declare_parameter<int>("prediction_horizon_steps", 10);
+  this->declare_parameter<int>("control_horizon_steps", 10);
+  this->declare_parameter<double>("goal_dist_tolerance", 0.2);
+  this->declare_parameter<double>("goal_theta_tolerance", 0.1);
+  this->declare_parameter<double>("path_smoothing_window", 0.5);
+  this->declare_parameter<std::string>("map_frame", "map");
+  this->declare_parameter<std::string>("base_frame", "base_link");
+  this->declare_parameter<std::string>("odom_topic", "odom");
+  this->declare_parameter<bool>("use_bond", true);
+  this->declare_parameter<double>("controller_frequency", 10.0);
+  this->declare_parameter<std::vector<double>>("Q_matrix_diag", {10.0, 10.0, 1.0, 1.0});
+  this->declare_parameter<std::vector<double>>("R_d_matrix_diag", {10.0, 10.0});
 }
 
-MPCController::~MPCController() = default;
+MPCController::~MPCController()
+{
+  if (debug_mpc_ && mpc_logger_) {
+    mpc_logger_->close();
+  }
+  RCLCPP_INFO(get_logger(), "MPCController destroyed.");
+}
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
@@ -25,7 +51,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_global_path", 10);
   
   // Determine which type of cmd_vel to use
-  use_stamped_cmd_vel_ = this->declare_parameter<bool>("use_stamped_cmd_vel", false);
+  this->get_parameter("use_stamped_cmd_vel", use_stamped_cmd_vel_);
   
   // Create the appropriate publisher based on the parameter
   if (use_stamped_cmd_vel_) {
@@ -37,7 +63,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   }
 
   // Choose if debug topics are created based on parameter
-  debug_mpc_ = this->declare_parameter<bool>("debug_mpc", false);
+  this->get_parameter("debug_mpc", debug_mpc_);
 
   if (debug_mpc_) {
     predicted_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("mpc_predicted_path", 10);
@@ -45,12 +71,12 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   }
 
   // Parameters
-  max_linear_vel_ = this->declare_parameter<double>("max_linear_vel", 0.5);
-  max_angular_vel_ = this->declare_parameter<double>("max_angular_vel", 1.0);
-  max_linear_accel_ = this->declare_parameter<double>("max_linear_accel", 0.2);
-  max_angular_accel_ = this->declare_parameter<double>("max_angular_accel", 0.3);
-  prediction_horizon_steps_ = this->declare_parameter<int>("prediction_horizon_steps", 10);
-  control_horizon_steps_ = this->declare_parameter<int>("control_horizon_steps", 10);
+  this->get_parameter("max_linear_vel", max_linear_vel_);
+  this->get_parameter("max_angular_vel", max_angular_vel_);
+  this->get_parameter("max_linear_accel", max_linear_accel_);
+  this->get_parameter("max_angular_accel", max_angular_accel_);
+  this->get_parameter("prediction_horizon_steps", prediction_horizon_steps_);
+  this->get_parameter("control_horizon_steps", control_horizon_steps_);
   
   // Validate horizons
   if (control_horizon_steps_ > prediction_horizon_steps_) {
@@ -59,27 +85,32 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
     control_horizon_steps_ = prediction_horizon_steps_;
   }
   
-  goal_dist_tolerance_ = this->declare_parameter<double>("goal_dist_tolerance", 0.2);
-  goal_theta_tolerance_ = this->declare_parameter<double>("goal_theta_tolerance", 0.1);
-  path_smoothing_window_ = this->declare_parameter<double>("path_smoothing_window", 0.5);
+  this->get_parameter("goal_dist_tolerance", goal_dist_tolerance_);
+  this->get_parameter("goal_theta_tolerance", goal_theta_tolerance_);
+  this->get_parameter("path_smoothing_window", path_smoothing_window_);
   
   // Frame IDs
-  map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
-  base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
-  std::string odom_topic = this->declare_parameter<std::string>("odom_topic", "odom");
+  this->get_parameter("map_frame", map_frame_);
+  this->get_parameter("base_frame", base_frame_);
+  std::string odom_topic;
+  this->get_parameter("odom_topic", odom_topic);
   
   // Create bond
-  create_bond();
+  this->get_parameter("use_bond", use_bond_);
+  if (use_bond_) {
+    create_bond();
+  }
   
   // Control time step
-  double controller_frequency = this->declare_parameter<double>("controller_frequency", 10.0);
+  double controller_frequency;
+  this->get_parameter("controller_frequency", controller_frequency);
   d_t_ = 1.0 / controller_frequency;
   
   // MPC weight matrices Q[x, y, s_theta, c_theta], R_d[dv, dw]
-  std::vector<double> q_diag = this->declare_parameter<std::vector<double>>(
-    "Q_matrix_diag", {10.0, 10.0, 1.0, 1.0});
-  std::vector<double> rd_diag = this->declare_parameter<std::vector<double>>(
-    "R_d_matrix_diag", {10.0, 10.0});
+  std::vector<double> q_diag;
+  this->get_parameter("Q_matrix_diag", q_diag);
+  std::vector<double> rd_diag;
+  this->get_parameter("R_d_matrix_diag", rd_diag);
   
   Q_ = Eigen::Matrix4d::Zero();
   R_d_ = Eigen::Matrix2d::Zero();
@@ -133,6 +164,19 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
     [this](const std::shared_ptr<GoalHandleFollowPath> goal_handle) {
       handle_goal(goal_handle);
     });
+
+  // Create timers but keep them paused (will be activated in on_activate)
+  timer_control_loop_ = this->create_wall_timer(
+    std::chrono::milliseconds(100),
+    std::bind(&MPCController::control_loop, this)
+  );
+  timer_control_loop_->cancel();
+
+  timer_path_pub_ = this->create_wall_timer(
+    std::chrono::seconds(1),
+    std::bind(&MPCController::publish_debug_path, this)
+  );
+  timer_path_pub_->cancel();
 
   // Note: initialized_ will be set to true in on_activate()
   initialized_ = false;
@@ -195,37 +239,39 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
   }
 
   // Bond should already be started from on_configure
-  if (bond_) {
+  if (use_bond_ && bond_) {
     RCLCPP_INFO(get_logger(), "Bond is active with ID: %s", bond_id_.c_str());
+  } else {
+    RCLCPP_INFO(get_logger(), "Bond management is disabled");
   }
 
   // Start main control loop timer
-  timer_control_loop_ = this->create_wall_timer(
-    std::chrono::milliseconds(100),
-    std::bind(&MPCController::control_loop, this)
-  );
+  if (timer_control_loop_) {
+    timer_control_loop_->reset();
+  }
 
-  timer_path_pub_ = this->create_wall_timer(
-    std::chrono::seconds(1),
-    std::bind(&MPCController::publish_debug_path, this)
-  );
+  if (timer_path_pub_) {
+    timer_path_pub_->reset();
+  }
 
   // Enable the controller - now it can accept goals
   initialized_ = true;
 
-  // Open log file
-  auto now = std::chrono::system_clock::now();
-  auto in_time_t = std::chrono::system_clock::to_time_t(now);
-  std::stringstream ss;
-  ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
-  std::string home_dir = std::getenv("HOME");
-  std::string log_file = home_dir + "/.ros/log/mpc_data_" + ss.str() + "_" + std::to_string(getpid()) + ".csv";
-  
-  if (mpc_logger_->open(log_file)) {
-    RCLCPP_INFO(get_logger(), "MPC Logging started: %s", log_file.c_str());
-    mpc_logger_->write_header(prediction_horizon_steps_);
-  } else {
-    RCLCPP_ERROR(get_logger(), "Failed to open MPC log file: %s", log_file.c_str());
+  // Open log file if debug is enabled
+  if (debug_mpc_) {
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
+    std::string home_dir = std::getenv("HOME");
+    std::string log_file = home_dir + "/.ros/log/mpc_data_" + ss.str() + "_" + std::to_string(getpid()) + ".csv";
+    
+    if (mpc_logger_->open(log_file)) {
+      RCLCPP_INFO(get_logger(), "MPC Logging started: %s", log_file.c_str());
+      mpc_logger_->write_header(prediction_horizon_steps_);
+    } else {
+      RCLCPP_ERROR(get_logger(), "Failed to open MPC log file: %s", log_file.c_str());
+    }
   }
 
   RCLCPP_INFO(get_logger(), "MPCController on_activate() is called.");
@@ -248,12 +294,15 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
     cmd_vel_pub_->on_deactivate();
   }
 
+  if (timer_control_loop_) {
+    timer_control_loop_->cancel();
+  }
   if (timer_path_pub_) {
     timer_path_pub_->cancel();
   }
 
   // Stop bond
-  if (bond_) {
+  if (use_bond_ && bond_) {
     // Bond will be automatically destroyed, no explicit shutdown needed
     RCLCPP_INFO(get_logger(), "Bond stopped");
   }
@@ -265,8 +314,10 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   reset_state();
 
   // Close log file
-  mpc_logger_->close();
-  RCLCPP_INFO(get_logger(), "MPC Logging stopped");
+  if (debug_mpc_ && mpc_logger_) {
+    mpc_logger_->close();
+    RCLCPP_INFO(get_logger(), "MPC Logging stopped");
+  }
 
   RCLCPP_INFO(get_logger(), "MPCController on_deactivate() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -279,6 +330,11 @@ MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  timer_control_loop_.reset();
+  odom_sub_.reset();
+  action_server_.reset();
+  tf_listener_.reset();
+  tf_buffer_.reset();
   if(debug_mpc_) {
     predicted_path_pub_.reset();
     debug_pose_pub_.reset();
@@ -298,6 +354,11 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
   timer_path_pub_.reset();
+  timer_control_loop_.reset();
+  odom_sub_.reset();
+  action_server_.reset();
+  tf_listener_.reset();
+  tf_buffer_.reset();
   if(debug_mpc_) {
     predicted_path_pub_.reset();
     debug_pose_pub_.reset();
@@ -413,7 +474,7 @@ void MPCController::control_loop()
   }
 
   // Check bond status
-  if (bond_timeout_detected_) {
+  if (use_bond_ && bond_timeout_detected_) {
     RCLCPP_ERROR(get_logger(), "Bond timeout detected! Stopping robot for safety.");
     geometry_msgs::msg::Twist stop_cmd;
     stop_cmd.linear.x = 0.0;
@@ -479,7 +540,7 @@ void MPCController::control_loop()
     publish_velocity_command(cmd);
 
     // Log data
-    if (initialized_ && !global_plan_.poses.empty()) {
+    if (debug_mpc_ && initialized_ && !global_plan_.poses.empty()) {
       auto ref_pose = get_temporal_reference(current_time);
 
       double dx = ref_pose.pose.position.x - pose.pose.position.x;

@@ -163,6 +163,7 @@ private:
   bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
   double path_smoothing_window_;  // Smoothing window in meters
   bool debug_mpc_;  // Enable MPC debugging output
+  bool use_bond_;   // Enable bond usage
   
   // MPC weight matrices
   Eigen::Matrix4d Q_;  // State error weight [x, y, s_theta, c_theta]
