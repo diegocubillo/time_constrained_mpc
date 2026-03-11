@@ -5,7 +5,8 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   
-  auto node = std::make_shared<mpc_controller::MPCController>();
+  rclcpp::NodeOptions options;
+  auto node = std::make_shared<mpc_controller::MPCController>(options);
   
   rclcpp::spin(node->get_node_base_interface());
   

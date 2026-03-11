@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -19,18 +20,18 @@ find_package(Eigen3 REQUIRED)
 find_package(osqp REQUIRED)
 find_package(bondcpp REQUIRED)
 
-add_executable(time_constrained_mpc 
-  src/time_constrained_mpc.cpp
-  src/main.cpp)
-target_include_directories(time_constrained_mpc PUBLIC
+# Shared Library Component
+add_library(${PROJECT_NAME}_node SHARED 
+  src/time_constrained_mpc.cpp)
+target_include_directories(${PROJECT_NAME}_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${EIGEN3_INCLUDE_DIR})
-target_compile_features(time_constrained_mpc PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+target_compile_features(${PROJECT_NAME}_node PUBLIC c_std_99 cxx_std_17)
 
-# Link dependencies
-ament_target_dependencies(time_constrained_mpc
+ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
+  rclcpp_components
   rclcpp_action
   rclcpp_lifecycle
   geometry_msgs
@@ -41,13 +42,17 @@ ament_target_dependencies(time_constrained_mpc
   Eigen3
   bondcpp
 )
+target_link_libraries(${PROJECT_NAME}_node osqp::osqp)
 
-target_link_libraries(time_constrained_mpc
-  osqp::osqp
+rclcpp_components_register_node(${PROJECT_NAME}_node
+  PLUGIN "mpc_controller::MPCController"
+  EXECUTABLE time_constrained_mpc
 )
 
-install(TARGETS time_constrained_mpc
-  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS ${PROJECT_NAME}_node
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME})
 
 # Install Python scripts
 install(PROGRAMS

@@ -7,8 +7,8 @@
 namespace mpc_controller
 {
 
-MPCController::MPCController()
-: rclcpp_lifecycle::LifecycleNode("mpc_controller")
+MPCController::MPCController(const rclcpp::NodeOptions & options)
+: rclcpp_lifecycle::LifecycleNode("mpc_controller", options)
 {
   // Initialize bond ID to match Nav2 lifecycle manager expectations
   bond_id_ = get_name();
@@ -1662,7 +1662,7 @@ void MPCController::destroy_bond()
 void MPCController::bond_timeout_callback()
 {
   RCLCPP_ERROR(get_logger(), "Bond connection broken! Communication with lifecycle manager lost.");
-  bond_timeout_detected_ = true;
+    bond_timeout_detected_ = true;
   
   // Stop the robot for safety
   if (initialized_) {
@@ -1678,3 +1678,10 @@ void MPCController::bond_timeout_callback()
 }
 
 }  // namespace mpc_controller
+
+#include "rclcpp_components/register_node_macro.hpp"
+
+// Register the component with class_loader
+// This acts as a sort of entry point, allowing the component to be discoverable when its library
+// is being loaded into a running process.
+RCLCPP_COMPONENTS_REGISTER_NODE(mpc_controller::MPCController)

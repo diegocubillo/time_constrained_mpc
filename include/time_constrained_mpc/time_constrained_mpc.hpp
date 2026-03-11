@@ -32,7 +32,7 @@ namespace mpc_controller
 class MPCController : public rclcpp_lifecycle::LifecycleNode
 {
 public:
-  explicit MPCController();
+  explicit MPCController(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
   ~MPCController() override;
 
   // Lifecycle callbacks
