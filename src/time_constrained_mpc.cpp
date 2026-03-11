@@ -2,6 +2,7 @@
 #include <tf2/utils.h>
 #include <cmath>
 #include <algorithm>
+#include <unistd.h>
 
 namespace mpc_controller
 {
@@ -89,10 +90,13 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   for (size_t i = 0; i < 2; ++i) {
     R_d_(i, i) = rd_diag[i];
   }
+
+  // this->declare_parameter("qos_overrides./tf.subscription.reliability", "best_effort");
+  // this->set_parameter(rclcpp::Parameter("qos_overrides./tf.subscription.reliability", "best_effort"));
   
   // TF2 setup
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
   
   // Odometry subscriber
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -215,7 +219,7 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
   std::stringstream ss;
   ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
   std::string home_dir = std::getenv("HOME");
-  std::string log_file = home_dir + "/.ros/log/mpc_data_" + ss.str() + ".csv";
+  std::string log_file = home_dir + "/.ros/log/mpc_data_" + ss.str() + "_" + std::to_string(getpid()) + ".csv";
   
   if (mpc_logger_->open(log_file)) {
     RCLCPP_INFO(get_logger(), "MPC Logging started: %s", log_file.c_str());
