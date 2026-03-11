@@ -131,13 +131,22 @@ private:
   std::string bond_id_;
   bool bond_timeout_detected_{false};
   
+  // Control phase state machine
+  enum class ControlPhase {
+    INITIAL_ROTATION,   // Rotate in place to align with path start
+    PATH_FOLLOWING,     // MPC tracks the path (position + time only)
+    FINAL_ROTATION      // Rotate in place to align with goal orientation
+  };
+
   // State variables
   nav_msgs::msg::Path global_plan_;
   nav_msgs::msg::Odometry current_odom_;
   rclcpp::Time path_start_time_;  // Time when path execution started
   bool initialized_{false};
   bool has_odom_{false};
-  bool initial_rotation_completed_{false};
+  ControlPhase control_phase_{ControlPhase::INITIAL_ROTATION};
+  bool has_goal_orientation_{false};  // Whether the goal has an explicit orientation
+  geometry_msgs::msg::Quaternion goal_orientation_;  // Stored goal orientation
   Eigen::Vector2d u_prev_{Eigen::Vector2d::Zero()};
 
   // MPC parameters
