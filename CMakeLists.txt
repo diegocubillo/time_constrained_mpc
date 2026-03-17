@@ -49,10 +49,12 @@ rclcpp_components_register_node(${PROJECT_NAME}_node
   EXECUTABLE time_constrained_mpc
 )
 
+ament_export_targets(${PROJECT_NAME}_node)
 install(TARGETS ${PROJECT_NAME}_node
+  EXPORT ${PROJECT_NAME}_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
-  RUNTIME DESTINATION lib/${PROJECT_NAME})
+  RUNTIME DESTINATION bin)
 
 # Install Python scripts
 install(PROGRAMS
