@@ -238,9 +238,14 @@ MPCController::on_activate(const rclcpp_lifecycle::State & /*state*/)
     cmd_vel_pub_->on_activate();
   }
 
-  // Bond should already be started from on_configure
   if (use_bond_ && bond_) {
-    RCLCPP_INFO(get_logger(), "Bond is active with ID: %s", bond_id_.c_str());
+    try {
+      bond_timeout_detected_ = false;
+      bond_->start();
+      RCLCPP_INFO(get_logger(), "Bond is active with ID: %s", bond_id_.c_str());
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "Failed to activate bond: %s", e.what());
+    }
   } else {
     RCLCPP_INFO(get_logger(), "Bond management is disabled");
   }
@@ -303,7 +308,7 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
 
   // Stop bond
   if (use_bond_ && bond_) {
-    // Bond will be automatically destroyed, no explicit shutdown needed
+    bond_->breakBond();
     RCLCPP_INFO(get_logger(), "Bond stopped");
   }
 
@@ -311,7 +316,7 @@ MPCController::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   initialized_ = false;
   
   // Stop the robot
-  reset_state();
+  reset_state(false);
 
   // Close log file
   if (debug_mpc_ && mpc_logger_) {
@@ -363,6 +368,9 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
     predicted_path_pub_.reset();
     debug_pose_pub_.reset();
   }
+
+  // Abort goal if active
+  reset_state(false);
   
   // Destroy bond
   destroy_bond();
@@ -572,7 +580,7 @@ void MPCController::control_loop()
         control_phase_ = ControlPhase::FINAL_ROTATION;
       } else {
         // No goal orientation — we're done
-        reset_state();
+        reset_state(true);
       }
     }
     return;
@@ -606,7 +614,7 @@ void MPCController::control_loop()
 
     // Final rotation done — goal fully achieved
     RCLCPP_INFO(get_logger(), "Final rotation completed. Goal orientation reached.");
-    reset_state();
+    reset_state(true);
     return;
   }
 
@@ -1415,12 +1423,17 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   return (dist < goal_dist_tolerance_) && (theta_error < goal_theta_tolerance_) && time_reached;
 }
 
-void MPCController::reset_state()
+void MPCController::reset_state(bool success)
 {
   if (current_goal_handle_ && current_goal_handle_->is_active()) {
     auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
-    current_goal_handle_->succeed(result);
-    RCLCPP_INFO(get_logger(), "Goal reached!");
+    if (success) {
+      current_goal_handle_->succeed(result);
+      RCLCPP_INFO(get_logger(), "Goal reached!");
+    } else {
+      current_goal_handle_->abort(result);
+      RCLCPP_INFO(get_logger(), "Goal aborted!");
+    }
   }
   
   global_plan_.poses.clear();
@@ -1641,14 +1654,14 @@ void MPCController::create_bond()
         RCLCPP_INFO(get_logger(), "Bond formed successfully");
       }  // formed callback
     );
-    
-    // Start the bond immediately - Nav2 expects this
-    bond_->start();
-    
-    RCLCPP_INFO(get_logger(), "Bond created and started with ID: %s on topic: bond", bond_id_.c_str());
-  } catch (const std::exception& e) {
-    RCLCPP_ERROR(get_logger(), "Failed to create bond: %s", e.what());
-  }
+
+    bond_->setHeartbeatPeriod(1.0);
+    // Config large connection timeout
+    bond_->setConnectTimeout(10.0);
+
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "Failed to create bond: %s", e.what());
+    }
 }
 
 void MPCController::destroy_bond()
@@ -1673,7 +1686,7 @@ void MPCController::bond_timeout_callback()
     publish_velocity_command(stop_cmd);
     
     // Cancel current goal if active
-    reset_state();
+    reset_state(false);
   }
 }
 

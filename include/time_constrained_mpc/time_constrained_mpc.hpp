@@ -91,7 +91,7 @@ public:
 
   // Goal check & reset
   bool goal_reached(const geometry_msgs::msg::PoseStamped &pose, const nav_msgs::msg::Path &path);
-  void reset_state();
+  void reset_state(bool success);
 
   // Bond management
   void create_bond();
