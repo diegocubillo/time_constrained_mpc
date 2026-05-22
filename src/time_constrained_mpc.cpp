@@ -409,6 +409,15 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
       double goal_yaw = tf2::getYaw(goal_quat);
       RCLCPP_INFO(get_logger(), "Goal has explicit orientation: yaw = %.2f rad (%.1f deg)",
                   goal_yaw, goal_yaw * 180.0 / M_PI);
+    } else {
+      // Unspecified final orientation (invalid quaternion).
+      // To avoid turning towards 0.0 radians at the end of the path during MPC tracking,
+      // we propagate the orientation of the second-to-last pose to the last pose.
+      if (original_path.poses.size() >= 2) {
+        original_path.poses.back().pose.orientation = 
+          original_path.poses[original_path.poses.size() - 2].pose.orientation;
+        RCLCPP_INFO(get_logger(), "Goal has no explicit orientation constraint. Using second-to-last pose orientation for path smoothing.");
+      }
     }
   }
 
@@ -1398,15 +1407,6 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   double dy = goal.pose.position.y - pose.pose.position.y;
   double dist = std::hypot(dx, dy);
   
-  // Check orientation difference
-  // Use the explicit goal orientation if provided, otherwise use path tangent
-  double goal_theta = has_goal_orientation_ ?
-    tf2::getYaw(goal_orientation_) :
-    tf2::getYaw(goal.pose.orientation);
-  double current_theta = tf2::getYaw(pose.pose.orientation);
-  double theta_error = std::abs(std::atan2(std::sin(goal_theta - current_theta), 
-                                           std::cos(goal_theta - current_theta)));
-  
   // Check time constraint
   rclcpp::Time current_time = this->now();
   rclcpp::Time last_path_time(goal.header.stamp);
@@ -1419,7 +1419,7 @@ bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose, co
   if (has_goal_orientation_) {
     return (dist < goal_dist_tolerance_ * 1.5) && time_reached;
   }
-  return (dist < goal_dist_tolerance_) && (theta_error < goal_theta_tolerance_) && time_reached;
+  return (dist < goal_dist_tolerance_) && time_reached;
 }
 
 void MPCController::reset_state(bool success)
