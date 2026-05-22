@@ -455,28 +455,27 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   }}.detach();
 }
 
-void MPCController::handle_cancel(const std::shared_ptr<GoalHandleFollowPath> goal_handle)
+void MPCController::handle_cancel(const std::shared_ptr<GoalHandleFollowPath> /*goal_handle*/)
 {
-  RCLCPP_INFO(get_logger(), "Canceling goal");
-  
-  // Stop the robot
-  geometry_msgs::msg::Twist stop_cmd;
-  stop_cmd.linear.x = 0.0;
-  stop_cmd.angular.z = 0.0;
-  publish_velocity_command(stop_cmd);
-  
-  // Clear the path
-  global_plan_.poses.clear();
-  current_goal_handle_.reset();
-  
-  // Mark goal as canceled
-  auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
-  goal_handle->canceled(result);
+  RCLCPP_INFO(get_logger(), "Cancel request accepted, deferring to control loop");
 }
 
 // ----- CONTROL LOOP -----
 void MPCController::control_loop()
 {
+  // Handle cancellations safely in the execution thread
+  if (current_goal_handle_ && current_goal_handle_->is_canceling()) {
+    auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
+    current_goal_handle_->canceled(result);
+    RCLCPP_INFO(get_logger(), "Goal canceled.");
+    
+    // Call reset_state(false) to stop robot and clear internal variables.
+    // Since we already marked it as canceled, it is no longer active, 
+    // so reset_state won't call abort().
+    reset_state(false);
+    return;
+  }
+
   if (!initialized_ || global_plan_.poses.empty()) {
     return;
   }
