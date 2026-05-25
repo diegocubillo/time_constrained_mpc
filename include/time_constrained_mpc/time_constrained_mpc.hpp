@@ -160,6 +160,8 @@ private:
 
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
+  double max_spatial_error_;
+  double max_temporal_error_;
   bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
   double path_smoothing_window_;  // Smoothing window in meters
   bool debug_mpc_;  // Enable MPC debugging output

@@ -27,6 +27,8 @@ MPCController::MPCController(const rclcpp::NodeOptions & options)
   this->declare_parameter<int>("control_horizon_steps", 10);
   this->declare_parameter<double>("goal_dist_tolerance", 0.2);
   this->declare_parameter<double>("goal_theta_tolerance", 0.1);
+  this->declare_parameter<double>("max_spatial_error", 2.0);
+  this->declare_parameter<double>("max_temporal_error", 5.0);
   this->declare_parameter<double>("path_smoothing_window", 0.5);
   this->declare_parameter<std::string>("map_frame", "map");
   this->declare_parameter<std::string>("base_frame", "base_link");
@@ -87,6 +89,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   
   this->get_parameter("goal_dist_tolerance", goal_dist_tolerance_);
   this->get_parameter("goal_theta_tolerance", goal_theta_tolerance_);
+  this->get_parameter("max_spatial_error", max_spatial_error_);
+  this->get_parameter("max_temporal_error", max_temporal_error_);
   this->get_parameter("path_smoothing_window", path_smoothing_window_);
   
   // Frame IDs
@@ -206,6 +210,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/)
   RCLCPP_INFO(get_logger(), "=== Goal Tolerances ===");
   RCLCPP_INFO(get_logger(), "Distance tolerance: %.2f m", goal_dist_tolerance_);
   RCLCPP_INFO(get_logger(), "Theta tolerance: %.2f rad", goal_theta_tolerance_);
+  RCLCPP_INFO(get_logger(), "Max spatial error: %.2f m", max_spatial_error_);
+  RCLCPP_INFO(get_logger(), "Max temporal error: %.2f s", max_temporal_error_);
   RCLCPP_INFO(get_logger(), "=== Path Processing ===");
   RCLCPP_INFO(get_logger(), "Path smoothing window: %.2f m", path_smoothing_window_);
   RCLCPP_INFO(get_logger(), "=== MPC Cost Weights ===");
@@ -579,6 +585,9 @@ void MPCController::control_loop()
 
     // Update feedback
     update_feedback(pose);
+    if (!initialized_ || global_plan_.poses.empty()) {
+      return;
+    }
 
     // Check if position + time goal is reached (ignoring orientation)
     if (goal_reached(pose, global_plan_)) {
@@ -1100,7 +1109,7 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
 
   
   // Log temporal tracking information
-  if (std::abs(temporal_error) > 0.5) {
+  if (std::abs(temporal_error) > 1.0) {
     if (temporal_error > 0) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "Temporal tracking: %.2f s ahead of schedule", temporal_error);
@@ -1385,12 +1394,42 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
   feedback->speed = get_robot_velocity().linear.x;
   
   // Calculate distance to temporal reference instead of final goal
-  auto ref_pose = get_temporal_reference(this->now());
+  rclcpp::Time current_time = this->now();
+  auto ref_pose = get_temporal_reference(current_time);
   double dx = ref_pose.pose.position.x - pose.pose.position.x;
   double dy = ref_pose.pose.position.y - pose.pose.position.y;
-  feedback->distance_to_goal = std::hypot(dx, dy);
+  double distance_to_ref = std::hypot(dx, dy);
+  feedback->distance_to_goal = distance_to_ref;
   
   current_goal_handle_->publish_feedback(feedback);
+
+  // --- SAFETY ABORT CHECKS ---
+  
+  // 1. Spatial tracking error check
+  if (max_spatial_error_ > 0.0 && distance_to_ref > max_spatial_error_)
+  {
+    RCLCPP_ERROR(get_logger(),
+      "Safety Abort: Spatial tracking error (%.2f m) exceeded maximum limit (%.2f m)!",
+      distance_to_ref, max_spatial_error_);
+    reset_state(false);
+    return;
+  }
+
+  // 2. Temporal delay check
+  if (max_temporal_error_ > 0.0 && !global_plan_.poses.empty())
+  {
+    rclcpp::Time scheduled_time(ref_pose.header.stamp);
+    double delay = (current_time - scheduled_time).seconds();
+    
+    if (delay > max_temporal_error_)
+    {
+      RCLCPP_ERROR(get_logger(),
+        "Safety Abort: Temporal delay (%.2f s) exceeded maximum limit (%.2f s)!",
+        delay, max_temporal_error_);
+      reset_state(false);
+      return;
+    }
+  }
 }
 
 // ----- GOAL CHECK & RESET -----

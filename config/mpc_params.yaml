@@ -17,6 +17,8 @@ mpc_controller:
     # # Goal Tolerances
     goal_dist_tolerance: 0.1    # meters
     goal_theta_tolerance: 0.15   # radians (approx 8.6 degrees)
+    max_spatial_error: 2.0       # meters (0.0 to disable)
+    max_temporal_error: 5.0      # seconds (0.0 to disable)
     
     # Path Smoothing
     path_smoothing_window: 0.5  # meters - smooths sharp corners
