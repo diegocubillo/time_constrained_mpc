@@ -361,6 +361,15 @@ MPCController::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
 MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
 {
+  RCLCPP_INFO(get_logger(), "MPCController on_shutdown() is called.");
+
+  // Abort goal if active and stop the robot while publishers and action server are still alive
+  reset_state(false);
+  
+  // Destroy bond
+  destroy_bond();
+  
+  // Reset and destroy all ROS2 components
   path_pub_.reset();
   cmd_vel_stamped_pub_.reset();
   cmd_vel_pub_.reset();
@@ -375,13 +384,6 @@ MPCController::on_shutdown(const rclcpp_lifecycle::State & /*state*/)
     debug_pose_pub_.reset();
   }
 
-  // Abort goal if active
-  reset_state(false);
-  
-  // Destroy bond
-  destroy_bond();
-  
-  RCLCPP_INFO(get_logger(), "MPCController on_shutdown() is called.");
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
 
@@ -510,8 +512,8 @@ void MPCController::control_loop()
   auto velocity = get_robot_velocity();
   rclcpp::Time current_time = this->now();
 
-  // Calculate temporal error only for monitoring
-  calculate_temporal_error(pose, current_time);
+  // Calculate temporal error
+  double temporal_error = calculate_temporal_error(pose, current_time);
 
   switch (control_phase_) {
 
@@ -536,7 +538,7 @@ void MPCController::control_loop()
       rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
 
       publish_velocity_command(rotate_cmd);
-      update_feedback(pose);
+      update_feedback(pose, temporal_error);
       return;
     }
 
@@ -581,10 +583,12 @@ void MPCController::control_loop()
     }
 
     // Publish debug path
-    path_pub_->publish(global_plan_);
+    if (path_pub_) {
+      path_pub_->publish(global_plan_);
+    }
 
     // Update feedback
-    update_feedback(pose);
+    update_feedback(pose, temporal_error);
     if (!initialized_ || global_plan_.poses.empty()) {
       return;
     }
@@ -625,7 +629,7 @@ void MPCController::control_loop()
       rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
 
       publish_velocity_command(rotate_cmd);
-      update_feedback(pose);
+      update_feedback(pose, temporal_error);
       return;
     }
 
@@ -1059,7 +1063,7 @@ std::vector<Eigen::Vector4d> MPCController::get_reference_trajectory_horizon(
     auto pose = get_temporal_reference(target_time);
 
     // Publish the first reference for debugging
-    if (i == 0 && debug_mpc_) {
+    if (i == 0 && debug_mpc_ && debug_pose_pub_) {
       debug_pose_pub_->publish(pose);
     }
     
@@ -1077,10 +1081,10 @@ std::vector<Eigen::Vector4d> MPCController::get_reference_trajectory_horizon(
   return references;
 }
 
-void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time)
+double MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time)
 {
   if (global_plan_.poses.empty()) {
-    return;
+    return 0.0;
   }
   
   // Find the closest pose in the path spatially
@@ -1121,7 +1125,7 @@ void MPCController::calculate_temporal_error(geometry_msgs::msg::PoseStamped cur
   RCLCPP_DEBUG(get_logger(),
     "Temporal error: %.3f s", temporal_error);
   
-  return;
+  return temporal_error;
 }
 
 // ----- MPC SOLVER -----
@@ -1341,7 +1345,9 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
           predicted_path.poses.push_back(p);
         }
         
-        predicted_path_pub_->publish(predicted_path);
+        if (predicted_path_pub_) {
+          predicted_path_pub_->publish(predicted_path);
+        }
       }
 
     } else {
@@ -1363,28 +1369,32 @@ geometry_msgs::msg::Twist MPCController::solve_mpc(
 void MPCController::publish_velocity_command(const geometry_msgs::msg::Twist &cmd)
 {
   if (use_stamped_cmd_vel_) {
-    // Publish TwistStamped
-    geometry_msgs::msg::TwistStamped cmd_stamped;
-    cmd_stamped.header.stamp = this->now();
-    cmd_stamped.header.frame_id = "base_link";
-    cmd_stamped.twist = cmd;
-    cmd_vel_stamped_pub_->publish(cmd_stamped);
+    if (cmd_vel_stamped_pub_) {
+      // Publish TwistStamped
+      geometry_msgs::msg::TwistStamped cmd_stamped;
+      cmd_stamped.header.stamp = this->now();
+      cmd_stamped.header.frame_id = "base_link";
+      cmd_stamped.twist = cmd;
+      cmd_vel_stamped_pub_->publish(cmd_stamped);
+    }
   } else {
-    // Publish Twist
-    cmd_vel_pub_->publish(cmd);
+    if (cmd_vel_pub_) {
+      // Publish Twist
+      cmd_vel_pub_->publish(cmd);
+    }
   }
 }
 
 // ----- PATH PUBLICATION -----
 void MPCController::publish_debug_path()
 {
-  if (!global_plan_.poses.empty()) {
+  if (!global_plan_.poses.empty() && path_pub_) {
     path_pub_->publish(global_plan_);
   }
 }
 
 // ----- ACTION FEEDBACK -----
-void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
+void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose, double temporal_error)
 {
   if (!current_goal_handle_ || !current_goal_handle_->is_active()) {
     return;
@@ -1418,8 +1428,10 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose)
   // 2. Temporal delay check
   if (max_temporal_error_ > 0.0 && !global_plan_.poses.empty())
   {
-    rclcpp::Time scheduled_time(ref_pose.header.stamp);
-    double delay = (current_time - scheduled_time).seconds();
+    // The temporal_error returned by calculate_temporal_error() is: (trajectory_time - current_time)
+    // If we are lagging behind, trajectory_time < current_time, making temporal_error negative.
+    // Therefore, the tracking delay is exactly -temporal_error.
+    double delay = -temporal_error;
     
     if (delay > max_temporal_error_)
     {

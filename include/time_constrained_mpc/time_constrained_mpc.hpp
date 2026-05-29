@@ -71,7 +71,7 @@ public:
   geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
   std::vector<Eigen::Vector4d> get_reference_trajectory_horizon(
     const rclcpp::Time &current_time, int N, double dt);
-  void calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time);
+  double calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time);
   
   // MPC solver
   geometry_msgs::msg::Twist solve_mpc(
@@ -87,7 +87,7 @@ public:
   void publish_debug_path();
 
   // Action feedback
-  void update_feedback(const geometry_msgs::msg::PoseStamped &pose);
+  void update_feedback(const geometry_msgs::msg::PoseStamped &pose, double temporal_error);
 
   // Goal check & reset
   bool goal_reached(const geometry_msgs::msg::PoseStamped &pose, const nav_msgs::msg::Path &path);
