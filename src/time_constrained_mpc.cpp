@@ -393,11 +393,14 @@ void MPCController::handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal
   const auto goal = goal_handle->get_goal();
   auto original_path = goal->path;
   
-  // Cancel previous goal if active
+  // Abort previous goal if active (server-side preemption)
+  // Note: we use abort() instead of canceled() because the goal is in EXECUTING state.
+  // canceled() requires the goal to be in CANCELING state first, which would cause
+  // an invalid state machine transition and crash.
   if (current_goal_handle_ && current_goal_handle_->is_active()) {
     auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
-    current_goal_handle_->canceled(result);
-    RCLCPP_INFO(get_logger(), "Previous goal canceled");
+    current_goal_handle_->abort(result);
+    RCLCPP_INFO(get_logger(), "Previous goal aborted (preempted by new goal)");
   }
   
   // Store new goal
