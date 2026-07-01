@@ -538,7 +538,7 @@ void MPCController::control_loop()
       geometry_msgs::msg::Twist rotate_cmd;
       rotate_cmd.linear.x = 0.0;
       double direction = (angle_error > 0) ? 1.0 : -1.0;
-      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.8);
 
       publish_velocity_command(rotate_cmd);
       update_feedback(pose, temporal_error);
@@ -629,7 +629,7 @@ void MPCController::control_loop()
       geometry_msgs::msg::Twist rotate_cmd;
       rotate_cmd.linear.x = 0.0;
       double direction = (angle_error > 0) ? 1.0 : -1.0;
-      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.5);
+      rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.8);
 
       publish_velocity_command(rotate_cmd);
       update_feedback(pose, temporal_error);
@@ -1429,7 +1429,8 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose,
   }
 
   // 2. Temporal delay check
-  if (max_temporal_error_ > 0.0 && !global_plan_.poses.empty())
+  if (max_temporal_error_ > 0.0 && !global_plan_.poses.empty() &&
+      control_phase_ != ControlPhase::FINAL_ROTATION)
   {
     // The temporal_error returned by calculate_temporal_error() is: (trajectory_time - current_time)
     // If we are lagging behind, trajectory_time < current_time, making temporal_error negative.
