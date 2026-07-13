@@ -1,51 +1,49 @@
 #pragma once
 
-#include "time_constrained_mpc/mpc_logger.hpp"
-#include <memory>
-#include <vector>
-#include <string>
-#include <Eigen/Dense>
-#include <Eigen/Sparse>
+#include "bondcpp/bond.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
-#include "nav_msgs/msg/path.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 #include "nav2_msgs/action/follow_path.hpp"
-#include "rclcpp_action/rclcpp_action.hpp"
-#include "rclcpp/rclcpp.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "osqp/osqp.h"
 #include "rclcpp/publisher.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
-#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
-#include "bondcpp/bond.hpp"
-#include "osqp/osqp.h"
+#include "time_constrained_mpc/mpc_logger.hpp"
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <memory>
+#include <string>
+#include <vector>
 
-using GoalHandleFollowPath = rclcpp_action::ServerGoalHandle<nav2_msgs::action::FollowPath>;
+using GoalHandleFollowPath =
+    rclcpp_action::ServerGoalHandle<nav2_msgs::action::FollowPath>;
 
+namespace mpc_controller {
 
-namespace mpc_controller
-{
-
-class MPCController : public rclcpp_lifecycle::LifecycleNode
-{
+class MPCController : public rclcpp_lifecycle::LifecycleNode {
 public:
-  explicit MPCController(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+  explicit MPCController(
+      const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   ~MPCController() override;
 
   // Lifecycle callbacks
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-  on_configure(const rclcpp_lifecycle::State & state) override;
+  on_configure(const rclcpp_lifecycle::State &state) override;
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-  on_activate(const rclcpp_lifecycle::State & state) override;
+  on_activate(const rclcpp_lifecycle::State &state) override;
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-  on_deactivate(const rclcpp_lifecycle::State & state) override;
+  on_deactivate(const rclcpp_lifecycle::State &state) override;
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-  on_cleanup(const rclcpp_lifecycle::State & state) override;
+  on_cleanup(const rclcpp_lifecycle::State &state) override;
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
-  on_shutdown(const rclcpp_lifecycle::State & state) override;
+  on_shutdown(const rclcpp_lifecycle::State &state) override;
 
   // Action handling (FollowPath)
   void handle_goal(const std::shared_ptr<GoalHandleFollowPath> goal_handle);
@@ -56,29 +54,31 @@ public:
 
   // Robot state acquisition
   geometry_msgs::msg::PoseStamped get_robot_pose();
-  geometry_msgs::msg::Twist get_robot_velocity();
 
   // Path processing
   nav_msgs::msg::Path interpolate_path(const nav_msgs::msg::Path &original_path,
-                                        double target_spacing = 0.1);
+                                       double target_spacing = 0.1);
   nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path &original_path,
-                                   double smoothing_window = 0.5);
-  nav_msgs::msg::Path resample_and_retime_path(const nav_msgs::msg::Path &interpolated_path,
-                                                const nav_msgs::msg::Path &smoothed_path,
-                                                double spacing = 0.1);
-  
+                                  double smoothing_window = 0.5);
+  nav_msgs::msg::Path
+  resample_and_retime_path(const nav_msgs::msg::Path &interpolated_path,
+                           const nav_msgs::msg::Path &smoothed_path,
+                           double spacing = 0.1);
+
   // Temporal reference calculation
-  geometry_msgs::msg::PoseStamped get_temporal_reference(const rclcpp::Time &target_time);
-  std::vector<Eigen::Vector4d> get_reference_trajectory_horizon(
-    const rclcpp::Time &current_time, int N, double dt);
-  double calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time);
-  
+  geometry_msgs::msg::PoseStamped
+  get_temporal_reference(const rclcpp::Time &target_time);
+  std::vector<Eigen::Vector4d>
+  get_reference_trajectory_horizon(const rclcpp::Time &current_time, int N,
+                                   double dt);
+  double calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose,
+                                  rclcpp::Time current_time);
+
   // MPC solver
-  geometry_msgs::msg::Twist solve_mpc(
-    const geometry_msgs::msg::PoseStamped &pose,
-    const geometry_msgs::msg::Twist &vel,
-    const std::vector<Eigen::Vector4d> &reference_trajectory,
-    double &solve_time_ms);
+  geometry_msgs::msg::Twist
+  solve_mpc(const geometry_msgs::msg::PoseStamped &pose,
+            const std::vector<Eigen::Vector4d> &reference_trajectory,
+            double &solve_time_ms);
 
   // Command publication
   void publish_velocity_command(const geometry_msgs::msg::Twist &cmd);
@@ -87,10 +87,12 @@ public:
   void publish_debug_path();
 
   // Action feedback
-  void update_feedback(const geometry_msgs::msg::PoseStamped &pose, double temporal_error);
+  void update_feedback(const geometry_msgs::msg::PoseStamped &pose,
+                       double temporal_error);
 
   // Goal check & reset
-  bool goal_reached(const geometry_msgs::msg::PoseStamped &pose, const nav_msgs::msg::Path &path);
+  bool goal_reached(const geometry_msgs::msg::PoseStamped &pose,
+                    const nav_msgs::msg::Path &path);
   void reset_state(bool success);
 
   // Bond management
@@ -100,77 +102,82 @@ public:
 
 private:
   // Helper methods for MPC
-  Eigen::Vector2d differential_drive_model(const Eigen::Vector4d &state, 
-                                           const Eigen::Vector2d &control, 
+  Eigen::Vector2d differential_drive_model(const Eigen::Vector4d &state,
+                                           const Eigen::Vector2d &control,
                                            double dt);
-  void build_mpc_matrices(const Eigen::Vector4d &current_state,
-                         const std::vector<Eigen::Vector4d> &reference_trajectory,
-                         const Eigen::Vector2d &u_ref,
-                         Eigen::SparseMatrix<double> &P,
-                         Eigen::VectorXd &q,
-                         Eigen::SparseMatrix<double> &A,
-                         Eigen::VectorXd &l,
-                         Eigen::VectorXd &u);
+  void
+  build_mpc_matrices(const Eigen::Vector4d &current_state,
+                     const std::vector<Eigen::Vector4d> &reference_trajectory,
+                     const Eigen::Vector2d &u_ref,
+                     Eigen::SparseMatrix<double> &P, Eigen::VectorXd &q,
+                     Eigen::SparseMatrix<double> &A, Eigen::VectorXd &l,
+                     Eigen::VectorXd &u);
 
   // ROS2 components
   std::shared_ptr<rclcpp::TimerBase> timer_path_pub_;
   std::shared_ptr<rclcpp::TimerBase> timer_control_loop_;
-  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr predicted_path_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr debug_pose_pub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr
+      path_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr
+      predicted_path_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<
+      geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>::SharedPtr
+      cmd_vel_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<
+      geometry_msgs::msg::PoseStamped>::SharedPtr debug_pose_pub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  rclcpp_action::Server<nav2_msgs::action::FollowPath>::SharedPtr action_server_;
+  rclcpp_action::Server<nav2_msgs::action::FollowPath>::SharedPtr
+      action_server_;
   std::shared_ptr<GoalHandleFollowPath> current_goal_handle_;
-  
+
   // Bond for heartbeat monitoring
   std::unique_ptr<bond::Bond> bond_;
   std::string bond_id_;
   bool bond_timeout_detected_{false};
-  
+
   // Control phase state machine
   enum class ControlPhase {
-    INITIAL_ROTATION,   // Rotate in place to align with path start
-    PATH_FOLLOWING,     // MPC tracks the path (position + time only)
-    FINAL_ROTATION      // Rotate in place to align with goal orientation
+    INITIAL_ROTATION, // Rotate in place to align with path start
+    PATH_FOLLOWING,   // MPC tracks the path (position + time only)
+    FINAL_ROTATION    // Rotate in place to align with goal orientation
   };
 
   // State variables
   nav_msgs::msg::Path global_plan_;
-  nav_msgs::msg::Odometry current_odom_;
-  rclcpp::Time path_start_time_;  // Time when path execution started
+  rclcpp::Time path_start_time_; // Time when path execution started
   bool initialized_{false};
-  bool has_odom_{false};
   ControlPhase control_phase_{ControlPhase::INITIAL_ROTATION};
-  bool has_goal_orientation_{false};  // Whether the goal has an explicit orientation
-  geometry_msgs::msg::Quaternion goal_orientation_;  // Stored goal orientation
+  bool has_goal_orientation_{
+      false}; // Whether the goal has an explicit orientation
+  geometry_msgs::msg::Quaternion goal_orientation_; // Stored goal orientation
   Eigen::Vector2d u_prev_{Eigen::Vector2d::Zero()};
 
   // MPC parameters
   double max_linear_vel_;
   double max_angular_vel_;
-  double max_linear_accel_;   // Max linear accel (m/s² from config, converted to m/s per timestep in on_configure)
-  double max_angular_accel_;  // Max angular accel (rad/s² from config, converted to rad/s per timestep in on_configure)
+  double max_linear_accel_; // Max linear accel (m/s² from config, converted to
+                            // m/s per timestep in on_configure)
+  double max_angular_accel_; // Max angular accel (rad/s² from config, converted
+                             // to rad/s per timestep in on_configure)
   int prediction_horizon_steps_;
   int control_horizon_steps_;
-  double d_t_;  // Control time step
+  double d_t_; // Control time step
 
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
   double max_spatial_error_;
   double max_temporal_error_;
-  bool use_stamped_cmd_vel_;  // Use TwistStamped (true) or Twist (false)
-  double path_smoothing_window_;  // Smoothing window in meters
-  bool debug_mpc_;  // Enable MPC debugging output
-  bool use_bond_;   // Enable bond usage
-  
+  bool use_stamped_cmd_vel_;     // Use TwistStamped (true) or Twist (false)
+  double path_smoothing_window_; // Smoothing window in meters
+  bool debug_mpc_;               // Enable MPC debugging output
+  bool use_bond_;                // Enable bond usage
+
   // MPC weight matrices
-  Eigen::Matrix4d Q_;  // State error weight [x, y, s_theta, c_theta]
-  Eigen::Matrix2d R_d_;  // Control rate weight
-  
+  Eigen::Matrix4d Q_;   // State error weight [x, y, s_theta, c_theta]
+  Eigen::Matrix2d R_d_; // Control rate weight
+
   // Frame IDs
   std::string map_frame_;
   std::string base_frame_;
@@ -180,4 +187,4 @@ private:
   std::vector<Eigen::Vector4d> last_predicted_states_;
 };
 
-}  // namespace mpc_controller
+} // namespace mpc_controller

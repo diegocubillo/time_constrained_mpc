@@ -33,7 +33,7 @@ $$
 
 ## 2. Linearization and Discretization
 
-The non-linear dynamics $\dot{\mathbf{x}}_{sc} = f(\mathbf{x}_{sc}, \mathbf{u})$ are linearized around a reference operating point. We use the **current measured velocity** $\mathbf{u}_{ref} = [v_{ref}, \omega_{ref}]^\top$ and the reference trajectory orientation for linearization.
+The non-linear dynamics $\dot{\mathbf{x}}_{sc} = f(\mathbf{x}_{sc}, \mathbf{u})$ are linearized around a reference operating point. We use the **last commanded velocity** $\mathbf{u}_{ref} = [v_{ref}, \omega_{ref}]^\top$ — i.e. the previous control input $\mathbf{u}_{k-1}$ last published to `/cmd_vel`, **not** an odometry measurement — together with the reference trajectory orientation for linearization. The controller therefore consumes only external **position** feedback (`tf`/mocap); its notion of the current velocity is entirely internal (the controller's own last command). This keeps the linearization consistent with the incremental (delta-u) augmented state (Section 3) and removes sensitivity to low-speed odometry artifacts (noise, encoder quantization, actuator deadband).
 
 ### 2.1 Jacobian Derivation
 The Jacobian matrices $A_c = \frac{\partial f}{\partial \mathbf{x}}$ and $B_c = \frac{\partial f}{\partial \mathbf{u}}$ are:
@@ -68,7 +68,7 @@ $$
 *\*Note: In the implementation, we approximate the coupling of linear velocity to position using the reference orientation components.*
 
 **Singularity Avoidance at Low Speed**:
-When $v_{meas} \approx 0$, the Jacobian terms relating $\theta$ to $x,y$ vanish, rendering the system uncontrollable in the solver's view. To preserve rank and steerability, we impose a lower bound on the linearization velocity:
+When $v_{ref} \approx 0$ (i.e. the last commanded speed is near zero), the Jacobian terms relating $\theta$ to $x,y$ vanish, rendering the system uncontrollable in the solver's view. To preserve rank and steerability, we impose a lower bound on the linearization velocity:
 $$ v_{ref}^* = \text{sgn}(v_{ref}) \cdot \max(|v_{ref}|, 0.01 \text{ m/s}) $$
 
 ## 3. Augmented Formulation (Velocity Increments)

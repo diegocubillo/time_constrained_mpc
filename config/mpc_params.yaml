@@ -42,4 +42,3 @@ mpc_controller:
     # Frame IDs
     # map_frame: "map"
     # base_frame: "base_link"
-    # odom_topic: "odom"
