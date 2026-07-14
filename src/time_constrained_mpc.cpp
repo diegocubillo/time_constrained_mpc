@@ -684,13 +684,8 @@ void MPCController::control_loop() {
     auto cmd = solve_mpc(pose, reference_trajectory, solve_time_ms);
     publish_velocity_command(cmd);
 
-    // Log data (reference is the goal itself during the approach).
-    if (debug_mpc_) {
-      double spatial_error =
-          std::hypot(gx - pose.pose.position.x, gy - pose.pose.position.y);
-      mpc_logger_->log(current_time.seconds(), pose, goal, spatial_error, cmd,
-                       solve_time_ms, last_predicted_states_);
-    }
+    log_control_step(pose, cmd, current_time, ControlPhase::PATH_FOLLOWING,
+                     solve_time_ms, last_predicted_states_);
 
     if (path_pub_) {
       path_pub_->publish(global_plan_);
