@@ -106,6 +106,20 @@ public:
   void bond_timeout_callback();
 
 private:
+  // Control phase state machine.
+  // The numeric values are part of the MPC log format (column "state", written
+  // by MPCLogger): INACTIVE 0, INITIAL_ROTATION 1, PATH_FOLLOWING 2,
+  // GOAL_APPROACH 3, FINAL_ROTATION 4. Keep them stable so the analysis tools
+  // stay consistent.
+  enum class ControlPhase {
+    INACTIVE = 0,         // Not following any path (idle / mission complete)
+    INITIAL_ROTATION = 1, // Rotate in place to align with path start
+    PATH_FOLLOWING = 2,   // MPC tracks the path (position + time only)
+    GOAL_APPROACH = 3, // MPC closes the last centimetres with a slow terminal
+                       // reference; finishes on goal-plane crossing
+    FINAL_ROTATION = 4 // Rotate in place to align with goal orientation
+  };
+
   // Helper methods for MPC
   Eigen::Vector2d differential_drive_model(const Eigen::Vector4d &state,
                                            const Eigen::Vector2d &control,
@@ -117,6 +131,17 @@ private:
                      Eigen::SparseMatrix<double> &P, Eigen::VectorXd &q,
                      Eigen::SparseMatrix<double> &A, Eigen::VectorXd &l,
                      Eigen::VectorXd &u);
+
+  // Write one log row for the current control step: the active phase (numeric
+  // state), the reference the controller is tracking and the commanded
+  // velocity. Called from every active phase so the log captures the full
+  // timeline (INITIAL_ROTATION / PATH_FOLLOWING / FINAL_ROTATION), not just
+  // path following.
+  void log_control_step(const geometry_msgs::msg::PoseStamped &pose,
+                        const geometry_msgs::msg::Twist &cmd,
+                        const rclcpp::Time &current_time, ControlPhase phase,
+                        double solve_time_ms,
+                        const std::vector<Eigen::Vector4d> &predicted_states);
 
   // ROS2 components
   std::shared_ptr<rclcpp::TimerBase> timer_path_pub_;
@@ -142,20 +167,11 @@ private:
   std::string bond_id_;
   bool bond_timeout_detected_{false};
 
-  // Control phase state machine
-  enum class ControlPhase {
-    INITIAL_ROTATION, // Rotate in place to align with path start
-    PATH_FOLLOWING,   // MPC tracks the path (position + time only)
-    GOAL_APPROACH,    // MPC closes the last centimetres with a slow terminal
-                      // reference; finishes on goal-plane crossing
-    FINAL_ROTATION    // Rotate in place to align with goal orientation
-  };
-
   // State variables
   nav_msgs::msg::Path global_plan_;
   rclcpp::Time path_start_time_; // Time when path execution started
   bool initialized_{false};
-  ControlPhase control_phase_{ControlPhase::INITIAL_ROTATION};
+  ControlPhase control_phase_{ControlPhase::INACTIVE};
   bool has_goal_orientation_{
       false}; // Whether the goal has an explicit orientation
   geometry_msgs::msg::Quaternion goal_orientation_; // Stored goal orientation

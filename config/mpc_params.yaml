@@ -26,7 +26,7 @@ mpc_controller:
     path_smoothing_window: 0.5  # meters - smooths sharp corners
 
     # Enable MPC Debugging Output
-    # debug_mpc: true
+    debug_mpc: true
     
     # Bond Settings
     use_bond: true

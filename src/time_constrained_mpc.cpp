@@ -538,6 +538,12 @@ void MPCController::control_loop() {
 
   switch (control_phase_) {
 
+  // ===== INACTIVE =====
+  // No path to follow. In practice control_loop() returns earlier when the plan
+  // is empty, so this is only a defensive no-op that keeps the switch total.
+  case ControlPhase::INACTIVE:
+    return;
+
   // ===== PHASE 1: INITIAL ROTATION =====
   // Rotate in place to align with the first point of the path
   case ControlPhase::INITIAL_ROTATION: {
@@ -564,6 +570,8 @@ void MPCController::control_loop() {
       rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.8);
 
       publish_velocity_command(rotate_cmd);
+      log_control_step(pose, rotate_cmd, current_time,
+                       ControlPhase::INITIAL_ROTATION, 0.0, {});
       update_feedback(pose, temporal_error);
       return;
     }
@@ -591,17 +599,9 @@ void MPCController::control_loop() {
     // Publish command
     publish_velocity_command(cmd);
 
-    // Log data
-    if (debug_mpc_ && initialized_ && !global_plan_.poses.empty()) {
-      auto ref_pose = get_temporal_reference(current_time);
-
-      double dx = ref_pose.pose.position.x - pose.pose.position.x;
-      double dy = ref_pose.pose.position.y - pose.pose.position.y;
-      double spatial_error = std::hypot(dx, dy);
-
-      mpc_logger_->log(current_time.seconds(), pose, ref_pose, spatial_error,
-                       cmd, solve_time_ms, last_predicted_states_);
-    }
+    // Log data.
+    log_control_step(pose, cmd, current_time, ControlPhase::PATH_FOLLOWING,
+                     solve_time_ms, last_predicted_states_);
 
     // Publish debug path
     if (path_pub_) {
@@ -726,6 +726,8 @@ void MPCController::control_loop() {
       rotate_cmd.angular.z = direction * (max_angular_vel_ * 0.8);
 
       publish_velocity_command(rotate_cmd);
+      log_control_step(pose, rotate_cmd, current_time,
+                       ControlPhase::FINAL_ROTATION, 0.0, {});
       update_feedback(pose, temporal_error);
       return;
     }
@@ -1653,6 +1655,29 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose,
   }
 }
 
+// ----- LOGGING -----
+void MPCController::log_control_step(
+    const geometry_msgs::msg::PoseStamped &pose,
+    const geometry_msgs::msg::Twist &cmd, const rclcpp::Time &current_time,
+    ControlPhase phase, double solve_time_ms,
+    const std::vector<Eigen::Vector4d> &predicted_states) {
+  if (!debug_mpc_ || !mpc_logger_ || global_plan_.poses.empty()) {
+    return;
+  }
+
+  // Reference the controller is (or would be) tracking at this instant, and the
+  // spatial error against it. During the rotation phases the robot does not
+  // translate, so this is the standing distance to the reference.
+  auto ref_pose = get_temporal_reference(current_time);
+  double dx = ref_pose.pose.position.x - pose.pose.position.x;
+  double dy = ref_pose.pose.position.y - pose.pose.position.y;
+  double spatial_error = std::hypot(dx, dy);
+
+  mpc_logger_->log(current_time.seconds(), static_cast<int>(phase), pose,
+                   ref_pose, spatial_error, cmd, solve_time_ms,
+                   predicted_states);
+}
+
 // ----- RESET -----
 void MPCController::reset_state(bool success) {
   if (current_goal_handle_ && current_goal_handle_->is_active()) {
@@ -1669,7 +1694,7 @@ void MPCController::reset_state(bool success) {
   global_plan_.poses.clear();
   u_prev_ = Eigen::Vector2d::Zero();
   current_goal_handle_.reset();
-  control_phase_ = ControlPhase::INITIAL_ROTATION;
+  control_phase_ = ControlPhase::INACTIVE; // no path to follow anymore
   has_goal_orientation_ = false;
 
   // Stop the robot
