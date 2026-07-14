@@ -15,8 +15,10 @@ mpc_controller:
     max_angular_accel: 3.0      # rad/s² (increased for quicker angular response)
     
     # # Goal Tolerances
-    goal_dist_tolerance: 0.1    # meters
+    goal_dist_tolerance: 0.03    # meters (also the along-track settle fallback in GOAL_APPROACH)
     goal_theta_tolerance: 0.15   # radians (approx 8.6 degrees)
+    goal_approach_radius: 0.2    # meters: hand over from PATH_FOLLOWING to GOAL_APPROACH within this radius
+    goal_approach_vel: 0.1      # m/s: capped approach speed; finish on goal-plane crossing
     max_spatial_error: 2.0       # meters (0.0 to disable)
     max_temporal_error: 5.0      # seconds (0.0 to disable)
     

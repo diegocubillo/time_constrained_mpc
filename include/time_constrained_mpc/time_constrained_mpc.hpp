@@ -71,6 +71,13 @@ public:
   std::vector<Eigen::Vector4d>
   get_reference_trajectory_horizon(const rclcpp::Time &current_time, int N,
                                    double dt);
+  // Terminal reference for the GOAL_APPROACH phase: a slow point that marches
+  // along the goal tangent toward the goal and clamps at it.
+  std::vector<Eigen::Vector4d>
+  get_approach_reference_horizon(const geometry_msgs::msg::PoseStamped &pose);
+  // Yaw of the path's direction of travel into the goal, taken from the last
+  // distinct path segment (NOT the goal orientation, which may differ).
+  double goal_tangent_yaw();
   double calculate_temporal_error(geometry_msgs::msg::PoseStamped current_pose,
                                   rclcpp::Time current_time);
 
@@ -90,9 +97,7 @@ public:
   void update_feedback(const geometry_msgs::msg::PoseStamped &pose,
                        double temporal_error);
 
-  // Goal check & reset
-  bool goal_reached(const geometry_msgs::msg::PoseStamped &pose,
-                    const nav_msgs::msg::Path &path);
+  // Reset internal state and finish the current goal (success or abort).
   void reset_state(bool success);
 
   // Bond management
@@ -141,6 +146,8 @@ private:
   enum class ControlPhase {
     INITIAL_ROTATION, // Rotate in place to align with path start
     PATH_FOLLOWING,   // MPC tracks the path (position + time only)
+    GOAL_APPROACH,    // MPC closes the last centimetres with a slow terminal
+                      // reference; finishes on goal-plane crossing
     FINAL_ROTATION    // Rotate in place to align with goal orientation
   };
 
@@ -157,8 +164,8 @@ private:
   // MPC parameters
   double max_linear_vel_;
   double max_angular_vel_;
-  double max_linear_accel_; // Max linear accel (m/s² from config, converted to
-                            // m/s per timestep in on_configure)
+  double max_linear_accel_;  // Max linear accel (m/s² from config, converted to
+                             // m/s per timestep in on_configure)
   double max_angular_accel_; // Max angular accel (rad/s² from config, converted
                              // to rad/s per timestep in on_configure)
   int prediction_horizon_steps_;
@@ -167,6 +174,10 @@ private:
 
   double goal_dist_tolerance_;
   double goal_theta_tolerance_;
+  double
+      goal_approach_radius_; // Distance to goal at which PATH_FOLLOWING hands
+                             // over to the GOAL_APPROACH terminal phase
+  double goal_approach_vel_; // Capped linear speed during GOAL_APPROACH (m/s)
   double max_spatial_error_;
   double max_temporal_error_;
   bool use_stamped_cmd_vel_;     // Use TwistStamped (true) or Twist (false)

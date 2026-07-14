@@ -25,6 +25,8 @@ MPCController::MPCController(const rclcpp::NodeOptions &options)
   this->declare_parameter<int>("control_horizon_steps", 10);
   this->declare_parameter<double>("goal_dist_tolerance", 0.2);
   this->declare_parameter<double>("goal_theta_tolerance", 0.1);
+  this->declare_parameter<double>("goal_approach_radius", 0.3);
+  this->declare_parameter<double>("goal_approach_vel", 0.08);
   this->declare_parameter<double>("max_spatial_error", 2.0);
   this->declare_parameter<double>("max_temporal_error", 5.0);
   this->declare_parameter<double>("path_smoothing_window", 0.5);
@@ -92,6 +94,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
 
   this->get_parameter("goal_dist_tolerance", goal_dist_tolerance_);
   this->get_parameter("goal_theta_tolerance", goal_theta_tolerance_);
+  this->get_parameter("goal_approach_radius", goal_approach_radius_);
+  this->get_parameter("goal_approach_vel", goal_approach_vel_);
   this->get_parameter("max_spatial_error", max_spatial_error_);
   this->get_parameter("max_temporal_error", max_temporal_error_);
   this->get_parameter("path_smoothing_window", path_smoothing_window_);
@@ -208,6 +212,10 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   RCLCPP_INFO(get_logger(), "=== Goal Tolerances ===");
   RCLCPP_INFO(get_logger(), "Distance tolerance: %.2f m", goal_dist_tolerance_);
   RCLCPP_INFO(get_logger(), "Theta tolerance: %.2f rad", goal_theta_tolerance_);
+  RCLCPP_INFO(get_logger(), "Goal approach radius: %.2f m",
+              goal_approach_radius_);
+  RCLCPP_INFO(get_logger(), "Goal approach speed: %.2f m/s",
+              goal_approach_vel_);
   RCLCPP_INFO(get_logger(), "Max spatial error: %.2f m", max_spatial_error_);
   RCLCPP_INFO(get_logger(), "Max temporal error: %.2f s", max_temporal_error_);
   RCLCPP_INFO(get_logger(), "=== Path Processing ===");
@@ -606,18 +614,89 @@ void MPCController::control_loop() {
       return;
     }
 
-    // Check if position + time goal is reached (ignoring orientation)
-    if (goal_reached(pose, global_plan_)) {
-      if (has_goal_orientation_) {
-        // Transition to FINAL_ROTATION
+    // Hand over to the dedicated terminal phase once the robot is on time and
+    // within the capture radius of the goal. The temporal gate keeps the
+    // time-constrained schedule honoured before the final precise approach; the
+    // GOAL_APPROACH phase then closes the last centimetres.
+    {
+      const auto &goal = global_plan_.poses.back();
+      double dgx = goal.pose.position.x - pose.pose.position.x;
+      double dgy = goal.pose.position.y - pose.pose.position.y;
+      double dist_to_goal = std::hypot(dgx, dgy);
+      bool time_reached = current_time >= rclcpp::Time(goal.header.stamp);
+      if (time_reached && dist_to_goal < goal_approach_radius_) {
         RCLCPP_INFO(get_logger(),
-                    "Position goal reached. Switching to FINAL_ROTATION.");
-        control_phase_ = ControlPhase::FINAL_ROTATION;
-      } else {
-        // No goal orientation — we're done
-        reset_state(true);
+                    "Within goal approach radius (%.3f m). Switching to "
+                    "GOAL_APPROACH.",
+                    dist_to_goal);
+        control_phase_ = ControlPhase::GOAL_APPROACH;
       }
     }
+    return;
+  }
+
+  // ===== PHASE 2b: GOAL APPROACH (terminal MPC) =====
+  // Close the last centimetres to the goal precisely. We reuse
+  // the MPC but feed it a slow terminal reference
+  // (get_approach_reference_horizon) that marches along the goal tangent and
+  // clamps AT the goal, so the receding horizon decelerates to a stop on the
+  // target without overshooting. The phase ends when the robot crosses the
+  // plane perpendicular to the tangent at the goal (along-track residual s <=
+  // 0), with a settle fallback so it never hangs.
+  case ControlPhase::GOAL_APPROACH: {
+    const auto &goal = global_plan_.poses.back();
+    double gx = goal.pose.position.x;
+    double gy = goal.pose.position.y;
+    double gtheta =
+        goal_tangent_yaw();       // path direction of travel into the goal
+    double tx = std::cos(gtheta); // unit tangent at the goal
+    double ty = std::sin(gtheta);
+
+    // Signed along-track distance still to go: positive before the goal, <= 0
+    // once the robot has crossed the goal's perpendicular plane.
+    double s =
+        tx * (gx - pose.pose.position.x) + ty * (gy - pose.pose.position.y);
+
+    // Finish on plane crossing, or on a settle fallback (a hair short and
+    // essentially stopped) so we can never hang if the robot stalls.
+    bool crossed = s <= 0.0;
+    bool settled =
+        (s < goal_dist_tolerance_) && (u_prev_(0) < 0.25 * goal_approach_vel_);
+    if (crossed || settled) {
+      RCLCPP_INFO(get_logger(),
+                  "Goal approach finished (along-track residual %.3f m, %s).",
+                  s, crossed ? "crossed goal plane" : "settled");
+      // Zero the linear velocity so it is not carried into the next phase.
+      geometry_msgs::msg::Twist stop_cmd;
+      publish_velocity_command(stop_cmd);
+      if (has_goal_orientation_) {
+        control_phase_ = ControlPhase::FINAL_ROTATION;
+      } else {
+        reset_state(true);
+      }
+      update_feedback(pose, temporal_error);
+      return;
+    }
+
+    // Otherwise keep driving in with the terminal reference.
+    auto reference_trajectory = get_approach_reference_horizon(pose);
+    double solve_time_ms = 0.0;
+    auto cmd = solve_mpc(pose, reference_trajectory, solve_time_ms);
+    publish_velocity_command(cmd);
+
+    // Log data (reference is the goal itself during the approach).
+    if (debug_mpc_) {
+      double spatial_error =
+          std::hypot(gx - pose.pose.position.x, gy - pose.pose.position.y);
+      mpc_logger_->log(current_time.seconds(), pose, goal, spatial_error, cmd,
+                       solve_time_ms, last_predicted_states_);
+    }
+
+    if (path_pub_) {
+      path_pub_->publish(global_plan_);
+    }
+
+    update_feedback(pose, temporal_error);
     return;
   }
 
@@ -1120,6 +1199,72 @@ std::vector<Eigen::Vector4d> MPCController::get_reference_trajectory_horizon(
   return references;
 }
 
+double MPCController::goal_tangent_yaw() {
+  const auto &poses = global_plan_.poses;
+  const auto &goal = poses.back();
+  // Walk back from the goal to the first point that is far enough to define a
+  // reliable direction of travel into the goal (robust to duplicated end
+  // samples). This is the geometric path tangent, which may differ from the
+  // goal orientation when an explicit final orientation was requested.
+  for (int i = static_cast<int>(poses.size()) - 2; i >= 0; --i) {
+    double dx = goal.pose.position.x - poses[i].pose.position.x;
+    double dy = goal.pose.position.y - poses[i].pose.position.y;
+    if (std::hypot(dx, dy) > 1e-3) {
+      return std::atan2(dy, dx);
+    }
+  }
+  // Degenerate path (all points coincident): fall back to the goal orientation.
+  return tf2::getYaw(goal.pose.orientation);
+}
+
+std::vector<Eigen::Vector4d> MPCController::get_approach_reference_horizon(
+    const geometry_msgs::msg::PoseStamped &pose) {
+  // Terminal (goal-approach) reference.
+  //
+  // We reuse the trajectory-tracking MPC but feed it a purpose-built reference
+  // for the final centimetres: a point that marches along the path tangent from
+  // the robot's current along-track position toward the goal at the (small)
+  // approach speed, and CLAMPS at the goal (offset 0) — it never goes past it.
+  // Because the later horizon samples pile up exactly on the goal, the receding
+  // horizon anticipates the stop and decelerates to rest on the target, so the
+  // robot does not arrive with leftover velocity that drifts past it. Placing
+  // every sample on the tangent line through the goal also drives the
+  // cross-track error to zero. The speed is shaped purely by the reference
+  // spacing, so the solver keeps coordinating v and omega optimally under the
+  // usual limits (no velocity is hard-fixed).
+  std::vector<Eigen::Vector4d> references;
+  references.reserve(prediction_horizon_steps_);
+
+  const auto &goal = global_plan_.poses.back();
+  const double gx = goal.pose.position.x;
+  const double gy = goal.pose.position.y;
+  const double gtheta =
+      goal_tangent_yaw();                // path direction of travel into goal
+  const double c_ref = std::cos(gtheta); // unit tangent at the goal
+  const double s_ref = std::sin(gtheta);
+
+  // Robot position projected onto the tangent, as a signed along-track offset
+  // from the goal (negative before the goal, 0 at the goal).
+  const double a_robot =
+      c_ref * (pose.pose.position.x - gx) + s_ref * (pose.pose.position.y - gy);
+
+  for (int i = 0; i < prediction_horizon_steps_; ++i) {
+    // Advance one approach step and clamp at the goal.
+    double a_i = a_robot + goal_approach_vel_ * (i + 1) * d_t_;
+    if (a_i > 0.0) {
+      a_i = 0.0;
+    }
+    Eigen::Vector4d ref;
+    ref(0) = gx + c_ref * a_i; // on the tangent line through the goal
+    ref(1) = gy + s_ref * a_i;
+    ref(2) = s_ref; // heading aligned with the path tangent
+    ref(3) = c_ref;
+    references.push_back(ref);
+  }
+
+  return references;
+}
+
 double MPCController::calculate_temporal_error(
     geometry_msgs::msg::PoseStamped current_pose, rclcpp::Time current_time) {
   if (global_plan_.poses.empty()) {
@@ -1485,8 +1630,11 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose,
     return;
   }
 
-  // 2. Temporal delay check
+  // 2. Temporal delay check. Skipped during the terminal phases (GOAL_APPROACH
+  // and FINAL_ROTATION), whose small deliberate slow-down is not a tracking
+  // failure and must not trigger a temporal abort.
   if (max_temporal_error_ > 0.0 && !global_plan_.poses.empty() &&
+      control_phase_ != ControlPhase::GOAL_APPROACH &&
       control_phase_ != ControlPhase::FINAL_ROTATION) {
     // The temporal_error returned by calculate_temporal_error() is:
     // (trajectory_time - current_time) If we are lagging behind,
@@ -1505,36 +1653,7 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose,
   }
 }
 
-// ----- GOAL CHECK & RESET -----
-bool MPCController::goal_reached(const geometry_msgs::msg::PoseStamped &pose,
-                                 const nav_msgs::msg::Path &path) {
-  if (path.poses.empty()) {
-    return false;
-  }
-
-  const auto &goal = path.poses.back();
-
-  // Check distance to goal
-  double dx = goal.pose.position.x - pose.pose.position.x;
-  double dy = goal.pose.position.y - pose.pose.position.y;
-  double dist = std::hypot(dx, dy);
-
-  // Check time constraint
-  rclcpp::Time current_time = this->now();
-  rclcpp::Time last_path_time(goal.header.stamp);
-  bool time_reached = current_time >= last_path_time;
-
-  // When has_goal_orientation_ is true, the FINAL_ROTATION phase handles
-  // orientation. Use a slightly relaxed distance tolerance (1.5x) for the
-  // position check because the MPC with discrete path spacing may not close the
-  // last few centimeters exactly. The FINAL_ROTATION phase will rotate in place
-  // at this "close enough" position.
-  if (has_goal_orientation_) {
-    return (dist < goal_dist_tolerance_ * 1.5) && time_reached;
-  }
-  return (dist < goal_dist_tolerance_) && time_reached;
-}
-
+// ----- RESET -----
 void MPCController::reset_state(bool success) {
   if (current_goal_handle_ && current_goal_handle_->is_active()) {
     auto result = std::make_shared<nav2_msgs::action::FollowPath::Result>();
