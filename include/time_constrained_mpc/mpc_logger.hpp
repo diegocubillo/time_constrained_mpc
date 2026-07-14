@@ -34,13 +34,15 @@ public:
 
     // Write header.
     // "state" is the numeric ControlPhase (INACTIVE 0, INITIAL_ROTATION 1,
-    // PATH_FOLLOWING 2, GOAL_APPROACH 3, FINAL_ROTATION 4). odom_v/odom_w are
-    // the odometry- measured body velocities, logged next to the commanded
-    // cmd_v/cmd_w so the firmware velocity tracking can be checked.
+    // PATH_FOLLOWING 2, GOAL_APPROACH 3, FINAL_ROTATION 4). error_spatial is the
+    // distance to the time-based reference; error_temporal is the schedule lag
+    // from calculate_temporal_error (positive = ahead of schedule, negative =
+    // behind), measured against a monotonic along-path progress index so it is
+    // robust to self-crossing paths.
     file_ << "timestamp,state,"
           << "ref_x,ref_y,ref_theta,"
           << "robot_x,robot_y,robot_theta,"
-          << "error_spatial,"
+          << "error_spatial,error_temporal,"
           << "cmd_v,cmd_w,"
           << "solve_time_ms";
 
@@ -73,8 +75,8 @@ public:
   void log(double timestamp, int control_state,
            const geometry_msgs::msg::PoseStamped &current_pose,
            const geometry_msgs::msg::PoseStamped &ref_pose,
-           double error_spatial, const geometry_msgs::msg::Twist &cmd,
-           double solve_time_ms,
+           double error_spatial, double error_temporal,
+           const geometry_msgs::msg::Twist &cmd, double solve_time_ms,
            const std::vector<Eigen::Vector4d> &predicted_states) {
     if (!file_.is_open())
       return;
@@ -88,8 +90,9 @@ public:
           << control_state << "," << ref_pose.pose.position.x << ","
           << ref_pose.pose.position.y << "," << ref_theta << ","
           << current_pose.pose.position.x << "," << current_pose.pose.position.y
-          << "," << current_theta << "," << error_spatial << "," << cmd.linear.x
-          << "," << cmd.angular.z << "," << solve_time_ms;
+          << "," << current_theta << "," << error_spatial << ","
+          << error_temporal << "," << cmd.linear.x << "," << cmd.angular.z
+          << "," << solve_time_ms;
 
     // Always write exactly horizon_steps_ prediction pairs so every row has the
     // same number of columns as the header, even when there is no MPC solution

@@ -29,6 +29,7 @@ MPCController::MPCController(const rclcpp::NodeOptions &options)
   this->declare_parameter<double>("goal_approach_vel", 0.08);
   this->declare_parameter<double>("max_spatial_error", 2.0);
   this->declare_parameter<double>("max_temporal_error", 5.0);
+  this->declare_parameter<double>("progress_search_window", 1.0);
   this->declare_parameter<double>("path_smoothing_window", 0.5);
   this->declare_parameter<std::string>("map_frame", "map");
   this->declare_parameter<std::string>("base_frame", "base_link");
@@ -98,6 +99,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   this->get_parameter("goal_approach_vel", goal_approach_vel_);
   this->get_parameter("max_spatial_error", max_spatial_error_);
   this->get_parameter("max_temporal_error", max_temporal_error_);
+  this->get_parameter("progress_search_window", progress_search_window_);
   this->get_parameter("path_smoothing_window", path_smoothing_window_);
 
   // Frame IDs
@@ -218,6 +220,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
               goal_approach_vel_);
   RCLCPP_INFO(get_logger(), "Max spatial error: %.2f m", max_spatial_error_);
   RCLCPP_INFO(get_logger(), "Max temporal error: %.2f s", max_temporal_error_);
+  RCLCPP_INFO(get_logger(), "Progress search window: %.2f m",
+              progress_search_window_);
   RCLCPP_INFO(get_logger(), "=== Path Processing ===");
   RCLCPP_INFO(get_logger(), "Path smoothing window: %.2f m",
               path_smoothing_window_);
@@ -472,6 +476,11 @@ void MPCController::handle_goal(
   global_plan_ =
       resample_and_retime_path(interpolated_path, smoothed_path, 0.1);
 
+  // Restart the monotonic progress tracker for the new plan (see
+  // calculate_temporal_error). Must be reset together with global_plan_ so a
+  // stale index from the previous, possibly longer, path is never reused.
+  progress_idx_ = 0;
+
   control_phase_ = ControlPhase::INITIAL_ROTATION; // Reset control phase
 
   // Validate that all timestamps are in the future
@@ -571,7 +580,7 @@ void MPCController::control_loop() {
 
       publish_velocity_command(rotate_cmd);
       log_control_step(pose, rotate_cmd, current_time,
-                       ControlPhase::INITIAL_ROTATION, 0.0, {});
+                       ControlPhase::INITIAL_ROTATION, 0.0, temporal_error, {});
       update_feedback(pose, temporal_error);
       return;
     }
@@ -601,7 +610,7 @@ void MPCController::control_loop() {
 
     // Log data.
     log_control_step(pose, cmd, current_time, ControlPhase::PATH_FOLLOWING,
-                     solve_time_ms, last_predicted_states_);
+                     solve_time_ms, temporal_error, last_predicted_states_);
 
     // Publish debug path
     if (path_pub_) {
@@ -685,7 +694,7 @@ void MPCController::control_loop() {
     publish_velocity_command(cmd);
 
     log_control_step(pose, cmd, current_time, ControlPhase::PATH_FOLLOWING,
-                     solve_time_ms, last_predicted_states_);
+                     solve_time_ms, temporal_error, last_predicted_states_);
 
     if (path_pub_) {
       path_pub_->publish(global_plan_);
@@ -722,7 +731,7 @@ void MPCController::control_loop() {
 
       publish_velocity_command(rotate_cmd);
       log_control_step(pose, rotate_cmd, current_time,
-                       ControlPhase::FINAL_ROTATION, 0.0, {});
+                       ControlPhase::FINAL_ROTATION, 0.0, temporal_error, {});
       update_feedback(pose, temporal_error);
       return;
     }
@@ -1268,28 +1277,47 @@ double MPCController::calculate_temporal_error(
     return 0.0;
   }
 
-  // Find the closest pose in the path spatially
-  double min_dist = std::numeric_limits<double>::max();
-  size_t closest_idx = 0;
+  const auto &poses = global_plan_.poses;
+  const size_t N = poses.size();
 
-  for (size_t i = 0; i < global_plan_.poses.size(); ++i) {
-    double dx =
-        global_plan_.poses[i].pose.position.x - current_pose.pose.position.x;
-    double dy =
-        global_plan_.poses[i].pose.position.y - current_pose.pose.position.y;
-    double dist = std::hypot(dx, dy);
-
-    if (dist < min_dist) {
-      min_dist = dist;
-      closest_idx = i;
-    }
+  // Guard against a stale index left over from a previous (possibly longer)
+  // plan, in case this runs before the reset in handle_goal/reset_state.
+  if (progress_idx_ >= N) {
+    progress_idx_ = N - 1;
   }
 
-  // TODO: Search only forward from closest_idx to find the temporally closest
-  // pose
+  auto dist_to = [&](size_t i) {
+    double dx = poses[i].pose.position.x - current_pose.pose.position.x;
+    double dy = poses[i].pose.position.y - current_pose.pose.position.y;
+    return std::hypot(dx, dy);
+  };
 
-  // Get the timestamp of that pose
-  rclcpp::Time trajectory_time(global_plan_.poses[closest_idx].header.stamp);
+  // Locate the robot on the plan with a MONOTONIC, bounded forward-window
+  // argmin: scan from the last progress index forward, accumulating arc length,
+  // and keep the closest pose within progress_search_window_ metres. The index
+  // never moves backward (so a past self-crossing branch cannot be matched ->
+  // no spurious timeout) and the search span is capped (so a future branch the
+  // path revisits cannot be jumped onto -> no overstated progress). This
+  // assumes the plan does not fold back on itself within the search window; at
+  // the ~0.1 m resample spacing and typical loop sizes that holds comfortably.
+  size_t best_idx = progress_idx_;
+  double min_dist = dist_to(progress_idx_);
+  double arc = 0.0;
+  for (size_t i = progress_idx_; i + 1 < N && arc < progress_search_window_;
+       ++i) {
+    double dx = poses[i + 1].pose.position.x - poses[i].pose.position.x;
+    double dy = poses[i + 1].pose.position.y - poses[i].pose.position.y;
+    arc += std::hypot(dx, dy);
+    double d = dist_to(i + 1);
+    if (d < min_dist) {
+      min_dist = d;
+      best_idx = i + 1;
+    }
+  }
+  progress_idx_ = best_idx;
+
+  // Get the timestamp of the matched pose
+  rclcpp::Time trajectory_time(poses[progress_idx_].header.stamp);
 
   // Calculate temporal error: positive = ahead of schedule, negative = behind
   double temporal_error = (trajectory_time - current_time).seconds();
@@ -1654,7 +1682,7 @@ void MPCController::update_feedback(const geometry_msgs::msg::PoseStamped &pose,
 void MPCController::log_control_step(
     const geometry_msgs::msg::PoseStamped &pose,
     const geometry_msgs::msg::Twist &cmd, const rclcpp::Time &current_time,
-    ControlPhase phase, double solve_time_ms,
+    ControlPhase phase, double solve_time_ms, double temporal_error,
     const std::vector<Eigen::Vector4d> &predicted_states) {
   if (!debug_mpc_ || !mpc_logger_ || global_plan_.poses.empty()) {
     return;
@@ -1669,7 +1697,7 @@ void MPCController::log_control_step(
   double spatial_error = std::hypot(dx, dy);
 
   mpc_logger_->log(current_time.seconds(), static_cast<int>(phase), pose,
-                   ref_pose, spatial_error, cmd, solve_time_ms,
+                   ref_pose, spatial_error, temporal_error, cmd, solve_time_ms,
                    predicted_states);
 }
 
@@ -1688,6 +1716,7 @@ void MPCController::reset_state(bool success) {
 
   global_plan_.poses.clear();
   u_prev_ = Eigen::Vector2d::Zero();
+  progress_idx_ = 0;
   current_goal_handle_.reset();
   control_phase_ = ControlPhase::INACTIVE; // no path to follow anymore
   has_goal_orientation_ = false;

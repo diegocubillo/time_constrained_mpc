@@ -140,7 +140,7 @@ private:
   void log_control_step(const geometry_msgs::msg::PoseStamped &pose,
                         const geometry_msgs::msg::Twist &cmd,
                         const rclcpp::Time &current_time, ControlPhase phase,
-                        double solve_time_ms,
+                        double solve_time_ms, double temporal_error,
                         const std::vector<Eigen::Vector4d> &predicted_states);
 
   // ROS2 components
@@ -177,6 +177,13 @@ private:
   geometry_msgs::msg::Quaternion goal_orientation_; // Stored goal orientation
   Eigen::Vector2d u_prev_{Eigen::Vector2d::Zero()};
 
+  // Monotonic along-path progress index used by calculate_temporal_error() to
+  // locate where the robot actually is on the plan. It only ever advances (via a
+  // bounded forward-window argmin), so paths that cross themselves cannot make
+  // the schedule-lag estimate jump to a past branch (spurious timeout) or leap
+  // onto a future branch (overstated progress). Reset to 0 on every new goal.
+  size_t progress_idx_{0};
+
   // MPC parameters
   double max_linear_vel_;
   double max_angular_vel_;
@@ -196,6 +203,9 @@ private:
   double goal_approach_vel_; // Capped linear speed during GOAL_APPROACH (m/s)
   double max_spatial_error_;
   double max_temporal_error_;
+  double progress_search_window_; // Forward look-ahead (m) for the monotonic
+                                  // progress-index argmin in
+                                  // calculate_temporal_error()
   bool use_stamped_cmd_vel_;     // Use TwistStamped (true) or Twist (false)
   double path_smoothing_window_; // Smoothing window in meters
   bool debug_mpc_;               // Enable MPC debugging output
