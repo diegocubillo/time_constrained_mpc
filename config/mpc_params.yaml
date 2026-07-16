@@ -10,8 +10,8 @@ mpc_controller:
     
     # Velocity Limits
     max_linear_vel: 0.5         # m/s
-    max_angular_vel: 1.5        # rad/s (increased for sharper turns)
-    max_linear_accel: 0.5       # m/s² (increased for quicker linear response)
+    max_angular_vel: 2.0        # rad/s (increased for sharper turns)
+    max_linear_accel: 1.5       # m/s² (increased for quicker linear response)
     max_angular_accel: 3.0      # rad/s² (increased for quicker angular response)
     
     # # Goal Tolerances
@@ -19,6 +19,9 @@ mpc_controller:
     goal_theta_tolerance: 0.15   # radians (approx 8.6 degrees)
     goal_approach_radius: 0.2    # meters: hand over from PATH_FOLLOWING to GOAL_APPROACH within this radius
     goal_approach_vel: 0.1      # m/s: capped approach speed; finish on goal-plane crossing
+    goal_approach_extension: -1.0  # meters the terminal reference aims BEYOND the goal (carrot).
+                                   # <0 => auto (N*vel*dt): cross the goal at approach speed, no braking.
+                                   # 0 => brake to rest on the goal (asymptotic crawl). Smaller>0 => more braking.
     max_spatial_error: 2.0       # meters (0.0 to disable)
     max_temporal_error: 5.0      # seconds (0.0 to disable)
     
@@ -39,7 +42,7 @@ mpc_controller:
     
     # Control rate weights (change/acceleration) [dv, domega]
     # Moderate smoothness - allow angular changes for tight turns
-    R_d_matrix_diag: [50.0, 50.0]
+    R_d_matrix_diag: [500.0, 50.0]
     
     # Frame IDs
     # map_frame: "map"

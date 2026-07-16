@@ -71,10 +71,11 @@ public:
   std::vector<Eigen::Vector4d>
   get_reference_trajectory_horizon(const rclcpp::Time &current_time, int N,
                                    double dt);
-  // Terminal reference for the GOAL_APPROACH phase: a slow point that marches
-  // along the goal tangent toward the goal and clamps at it.
+  // Terminal reference for the GOAL_APPROACH phase: a world-anchored point that
+  // advances along the goal tangent at the approach speed (parameterised by wall
+  // time from phase entry) and clamps beyond the goal by goal_approach_extension.
   std::vector<Eigen::Vector4d>
-  get_approach_reference_horizon(const geometry_msgs::msg::PoseStamped &pose);
+  get_approach_reference_horizon(const rclcpp::Time &current_time);
   // Yaw of the path's direction of travel into the goal, taken from the last
   // distinct path segment (NOT the goal orientation, which may differ).
   double goal_tangent_yaw();
@@ -170,6 +171,14 @@ private:
   // State variables
   nav_msgs::msg::Path global_plan_;
   rclcpp::Time path_start_time_; // Time when path execution started
+  // World anchor for the terminal approach reference, captured when the
+  // GOAL_APPROACH phase begins: the wall time at entry and the robot's
+  // along-track offset from the goal at that instant. The terminal reference is
+  // parameterised from these (fixed in the world, not re-anchored to the robot
+  // each cycle), so it keeps advancing at the approach speed and the tracker
+  // holds that speed instead of settling below it.
+  rclcpp::Time goal_approach_start_time_;
+  double goal_approach_start_along_{0.0};
   bool initialized_{false};
   ControlPhase control_phase_{ControlPhase::INACTIVE};
   bool has_goal_orientation_{
@@ -201,6 +210,12 @@ private:
       goal_approach_radius_; // Distance to goal at which PATH_FOLLOWING hands
                              // over to the GOAL_APPROACH terminal phase
   double goal_approach_vel_; // Capped linear speed during GOAL_APPROACH (m/s)
+  double goal_approach_extension_; // Distance the terminal reference aims BEYOND
+                                   // the goal along the tangent (carrot). Larger
+                                   // => less anticipatory braking; the robot
+                                   // crosses the goal at higher speed. A negative
+                                   // value is resolved in on_configure to
+                                   // N*v_app*dt (the no-braking threshold).
   double max_spatial_error_;
   double max_temporal_error_;
   double progress_search_window_; // Forward look-ahead (m) for the monotonic

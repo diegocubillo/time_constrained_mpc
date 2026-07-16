@@ -27,6 +27,7 @@ MPCController::MPCController(const rclcpp::NodeOptions &options)
   this->declare_parameter<double>("goal_theta_tolerance", 0.1);
   this->declare_parameter<double>("goal_approach_radius", 0.3);
   this->declare_parameter<double>("goal_approach_vel", 0.08);
+  this->declare_parameter<double>("goal_approach_extension", -1.0);
   this->declare_parameter<double>("max_spatial_error", 2.0);
   this->declare_parameter<double>("max_temporal_error", 5.0);
   this->declare_parameter<double>("progress_search_window", 1.0);
@@ -97,6 +98,7 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   this->get_parameter("goal_theta_tolerance", goal_theta_tolerance_);
   this->get_parameter("goal_approach_radius", goal_approach_radius_);
   this->get_parameter("goal_approach_vel", goal_approach_vel_);
+  this->get_parameter("goal_approach_extension", goal_approach_extension_);
   this->get_parameter("max_spatial_error", max_spatial_error_);
   this->get_parameter("max_temporal_error", max_temporal_error_);
   this->get_parameter("progress_search_window", progress_search_window_);
@@ -116,6 +118,16 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   double controller_frequency;
   this->get_parameter("controller_frequency", controller_frequency);
   d_t_ = 1.0 / controller_frequency;
+
+  // Resolve the terminal-reference extension (carrot beyond the goal). A negative
+  // value means "auto": use N*v_app*dt, the smallest extension for which the goal
+  // never falls inside the clamped tail of the prediction horizon, so the robot
+  // crosses the goal at the approach speed with (essentially) no anticipatory
+  // braking. Smaller positive values leave some braking; larger values none.
+  if (goal_approach_extension_ < 0.0) {
+    goal_approach_extension_ =
+        prediction_horizon_steps_ * goal_approach_vel_ * d_t_;
+  }
 
   // MPC weight matrices Q[x, y, s_theta, c_theta], R_d[dv, dw]
   std::vector<double> q_diag;
@@ -218,6 +230,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
               goal_approach_radius_);
   RCLCPP_INFO(get_logger(), "Goal approach speed: %.2f m/s",
               goal_approach_vel_);
+  RCLCPP_INFO(get_logger(), "Goal approach extension: %.2f m (beyond goal)",
+              goal_approach_extension_);
   RCLCPP_INFO(get_logger(), "Max spatial error: %.2f m", max_spatial_error_);
   RCLCPP_INFO(get_logger(), "Max temporal error: %.2f s", max_temporal_error_);
   RCLCPP_INFO(get_logger(), "Progress search window: %.2f m",
@@ -638,6 +652,15 @@ void MPCController::control_loop() {
                     "Within goal approach radius (%.3f m). Switching to "
                     "GOAL_APPROACH.",
                     dist_to_goal);
+        // Anchor the terminal reference to the world at this instant: record the
+        // entry time and the robot's along-track offset from the goal. The
+        // reference will advance from here at the approach speed on a fixed
+        // world schedule (see get_approach_reference_horizon).
+        double gth = goal_tangent_yaw();
+        goal_approach_start_time_ = current_time;
+        goal_approach_start_along_ =
+            std::cos(gth) * (pose.pose.position.x - goal.pose.position.x) +
+            std::sin(gth) * (pose.pose.position.y - goal.pose.position.y);
         control_phase_ = ControlPhase::GOAL_APPROACH;
       }
     }
@@ -645,13 +668,12 @@ void MPCController::control_loop() {
   }
 
   // ===== PHASE 2b: GOAL APPROACH (terminal MPC) =====
-  // Close the last centimetres to the goal precisely. We reuse
-  // the MPC but feed it a slow terminal reference
-  // (get_approach_reference_horizon) that marches along the goal tangent and
-  // clamps AT the goal, so the receding horizon decelerates to a stop on the
-  // target without overshooting. The phase ends when the robot crosses the
-  // plane perpendicular to the tangent at the goal (along-track residual s <=
-  // 0), with a settle fallback so it never hangs.
+  // Close the last centimetres to the goal precisely. We reuse the MPC but feed
+  // it a terminal reference (get_approach_reference_horizon) that advances along
+  // the goal tangent at the approach speed and clamps beyond the goal by
+  // goal_approach_extension. The phase ends when the robot crosses the plane
+  // perpendicular to the tangent at the goal (along-track residual s <= 0), with
+  // a settle fallback so it never hangs.
   case ControlPhase::GOAL_APPROACH: {
     const auto &goal = global_plan_.poses.back();
     double gx = goal.pose.position.x;
@@ -688,12 +710,12 @@ void MPCController::control_loop() {
     }
 
     // Otherwise keep driving in with the terminal reference.
-    auto reference_trajectory = get_approach_reference_horizon(pose);
+    auto reference_trajectory = get_approach_reference_horizon(current_time);
     double solve_time_ms = 0.0;
     auto cmd = solve_mpc(pose, reference_trajectory, solve_time_ms);
     publish_velocity_command(cmd);
 
-    log_control_step(pose, cmd, current_time, ControlPhase::PATH_FOLLOWING,
+    log_control_step(pose, cmd, current_time, ControlPhase::GOAL_APPROACH,
                      solve_time_ms, temporal_error, last_predicted_states_);
 
     if (path_pub_) {
@@ -1223,21 +1245,35 @@ double MPCController::goal_tangent_yaw() {
   return tf2::getYaw(goal.pose.orientation);
 }
 
-std::vector<Eigen::Vector4d> MPCController::get_approach_reference_horizon(
-    const geometry_msgs::msg::PoseStamped &pose) {
+std::vector<Eigen::Vector4d>
+MPCController::get_approach_reference_horizon(const rclcpp::Time &current_time) {
   // Terminal (goal-approach) reference.
   //
   // We reuse the trajectory-tracking MPC but feed it a purpose-built reference
-  // for the final centimetres: a point that marches along the path tangent from
-  // the robot's current along-track position toward the goal at the (small)
-  // approach speed, and CLAMPS at the goal (offset 0) — it never goes past it.
-  // Because the later horizon samples pile up exactly on the goal, the receding
-  // horizon anticipates the stop and decelerates to rest on the target, so the
-  // robot does not arrive with leftover velocity that drifts past it. Placing
-  // every sample on the tangent line through the goal also drives the
-  // cross-track error to zero. The speed is shaped purely by the reference
-  // spacing, so the solver keeps coordinating v and omega optimally under the
-  // usual limits (no velocity is hard-fixed).
+  // for the final centimetres: a point on the goal tangent that advances at the
+  // approach speed on a fixed WORLD schedule. Its along-track offset from the
+  // goal is a_head(t) = a_entry + v_app * (t - t_entry), where a_entry and
+  // t_entry were captured when the phase began, and it CLAMPS at
+  // goal_approach_extension beyond the goal.
+  //
+  // Anchoring the reference to the world (rather than recomputing it from the
+  // current robot pose each cycle) is what makes the tracker hold the approach
+  // speed: if the robot falls behind, the reference keeps moving and the growing
+  // error pulls the command back up to v_app, exactly as in path following. Were
+  // the reference re-anchored to the robot every cycle, the model's linearisation
+  // bias would instead settle the speed below v_app.
+  //
+  // The extension controls the braking near the goal. With extension 0 the head
+  // stops on the goal, so the horizon tail piles up on the target and the MPC
+  // decelerates to rest on it (no overshoot, but a slow final crawl). With
+  // extension >= N*v_app*dt the goal never falls inside the clamped tail, so the
+  // reference keeps pulling through the real goal and the robot crosses it at the
+  // approach speed with essentially no braking (the phase then stops it on the
+  // goal-plane crossing). Intermediate values give a terminal speed between 0 and
+  // v_app. Every sample lies on the tangent line through the goal, which also
+  // drives the cross-track error to zero. The speed is shaped purely by the
+  // reference schedule, so the solver keeps coordinating v and omega optimally
+  // under the usual limits (no velocity is hard-fixed).
   std::vector<Eigen::Vector4d> references;
   references.reserve(prediction_horizon_steps_);
 
@@ -1249,16 +1285,16 @@ std::vector<Eigen::Vector4d> MPCController::get_approach_reference_horizon(
   const double c_ref = std::cos(gtheta); // unit tangent at the goal
   const double s_ref = std::sin(gtheta);
 
-  // Robot position projected onto the tangent, as a signed along-track offset
-  // from the goal (negative before the goal, 0 at the goal).
-  const double a_robot =
-      c_ref * (pose.pose.position.x - gx) + s_ref * (pose.pose.position.y - gy);
+  // Along-track offset of the reference head now (advanced from the entry anchor
+  // at the approach speed), clamped beyond the goal by the extension.
+  const double elapsed = (current_time - goal_approach_start_time_).seconds();
+  const double a_head = goal_approach_start_along_ + goal_approach_vel_ * elapsed;
 
   for (int i = 0; i < prediction_horizon_steps_; ++i) {
-    // Advance one approach step and clamp at the goal.
-    double a_i = a_robot + goal_approach_vel_ * (i + 1) * d_t_;
-    if (a_i > 0.0) {
-      a_i = 0.0;
+    // Reference for horizon step i, i.e. the head projected dt*i into the future.
+    double a_i = a_head + goal_approach_vel_ * i * d_t_;
+    if (a_i > goal_approach_extension_) {
+      a_i = goal_approach_extension_;
     }
     Eigen::Vector4d ref;
     ref(0) = gx + c_ref * a_i; // on the tangent line through the goal
