@@ -32,6 +32,8 @@ MPCController::MPCController(const rclcpp::NodeOptions &options)
   this->declare_parameter<double>("max_temporal_error", 5.0);
   this->declare_parameter<double>("progress_search_window", 1.0);
   this->declare_parameter<double>("path_smoothing_window", 0.5);
+  this->declare_parameter<double>("cusp_angle_threshold", 3.0 * M_PI / 4.0);
+  this->declare_parameter<double>("max_reference_lead", 0.8);
   this->declare_parameter<std::string>("map_frame", "map");
   this->declare_parameter<std::string>("base_frame", "base_link");
   this->declare_parameter<bool>("use_bond", true);
@@ -103,6 +105,8 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   this->get_parameter("max_temporal_error", max_temporal_error_);
   this->get_parameter("progress_search_window", progress_search_window_);
   this->get_parameter("path_smoothing_window", path_smoothing_window_);
+  this->get_parameter("cusp_angle_threshold", cusp_angle_threshold_);
+  this->get_parameter("max_reference_lead", max_reference_lead_);
 
   // Frame IDs
   this->get_parameter("map_frame", map_frame_);
@@ -239,6 +243,9 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
   RCLCPP_INFO(get_logger(), "=== Path Processing ===");
   RCLCPP_INFO(get_logger(), "Path smoothing window: %.2f m",
               path_smoothing_window_);
+  RCLCPP_INFO(get_logger(), "Cusp angle threshold: %.2f rad (%.0f deg)",
+              cusp_angle_threshold_, cusp_angle_threshold_ * 180.0 / M_PI);
+  RCLCPP_INFO(get_logger(), "Max reference lead: %.2f m", max_reference_lead_);
   RCLCPP_INFO(get_logger(), "=== MPC Cost Weights ===");
   RCLCPP_INFO(
       get_logger(),
@@ -479,16 +486,42 @@ void MPCController::handle_goal(
   RCLCPP_INFO(get_logger(), "Received new path with %zu poses",
               original_path.poses.size());
 
-  // First, interpolate the path to increase point density
-  auto interpolated_path = interpolate_path(original_path, 0.1); // 10cm spacing
+  // Split the plan at direction reversals (cusps) BEFORE smoothing: an
+  // averaging smoother cannot represent a cusp (the tangent flips 180 deg
+  // between consecutive poses) and would collapse the reversal into geometry
+  // the forward-only MPC cannot track. Each monotone segment is processed
+  // independently and the reversal is executed as a timed in-place rotation
+  // between segments, scheduled into a dwell window the executor synthesizes
+  // symmetrically around the vertex stamp by borrowing time from the two
+  // adjacent plan intervals (plus any wait the plan already contains). See
+  // split_path_at_cusps() and the handover in control_loop().
+  auto raw_segments = split_path_at_cusps(original_path);
 
-  // Then smooth the interpolated path to handle sharp corners
-  auto smoothed_path = smooth_path(interpolated_path, path_smoothing_window_);
+  plan_segments_.clear();
+  plan_segments_.reserve(raw_segments.size());
+  for (const auto &raw_segment : raw_segments) {
+    // Interpolate to increase point density. Plan timestamps are preserved at
+    // the original waypoints and interpolated linearly in between.
+    auto interpolated_path = interpolate_path(raw_segment, 0.1); // 10cm spacing
 
-  // Resample and retime the smoothed path to ensure uniform spatial
-  // distribution and smooth velocity profile, avoiding bunching at start/end
-  global_plan_ =
-      resample_and_retime_path(interpolated_path, smoothed_path, 0.1);
+    // Smooth sharp (non-cusp) corners. The moving average is index-preserving
+    // and carries each pose's timestamp through untouched.
+    auto smoothed_path = smooth_path(interpolated_path, path_smoothing_window_);
+
+    // Resample to uniform spatial spacing, interpolating timestamps locally
+    // between neighbouring smoothed poses so the plan's local time structure
+    // (per-waypoint speeds, waits) survives smoothing.
+    plan_segments_.push_back(resample_and_retime_path(smoothed_path, 0.1));
+  }
+
+  current_segment_idx_ = 0;
+  global_plan_ = plan_segments_.front();
+
+  if (plan_segments_.size() > 1) {
+    RCLCPP_INFO(get_logger(),
+                "Plan split into %zu monotone segments (%zu reversals)",
+                plan_segments_.size(), plan_segments_.size() - 1);
+  }
 
   // Restart the monotonic progress tracker for the new plan (see
   // calculate_temporal_error). Must be reset together with global_plan_ so a
@@ -497,10 +530,12 @@ void MPCController::handle_goal(
 
   control_phase_ = ControlPhase::INITIAL_ROTATION; // Reset control phase
 
-  // Validate that all timestamps are in the future
-  if (!global_plan_.poses.empty()) {
+  // Validate that all timestamps are in the future. The span covers the whole
+  // plan: first pose of the first segment to last pose of the last segment.
+  if (!global_plan_.poses.empty() && !plan_segments_.back().poses.empty()) {
     auto first_time = rclcpp::Time(global_plan_.poses.front().header.stamp);
-    auto last_time = rclcpp::Time(global_plan_.poses.back().header.stamp);
+    auto last_time =
+        rclcpp::Time(plan_segments_.back().poses.back().header.stamp);
     RCLCPP_INFO(get_logger(),
                 "Path temporal span: %.2f to %.2f seconds from now",
                 (first_time - path_start_time_).seconds(),
@@ -634,6 +669,39 @@ void MPCController::control_loop() {
     // Update feedback
     update_feedback(pose, temporal_error);
     if (!initialized_ || global_plan_.poses.empty()) {
+      return;
+    }
+
+    // Intermediate segment (direction reversal ahead): hand over to the next
+    // segment instead of the terminal goal phases. The temporal reference
+    // saturates at the segment's last pose (the cusp vertex, held at its
+    // arrival stamp), so the MPC brings the robot to rest on the vertex; we
+    // capture once it is inside the goal tolerance and essentially stopped.
+    if (current_segment_idx_ + 1 < plan_segments_.size()) {
+      const auto &seg_end = global_plan_.poses.back();
+      double dsx = seg_end.pose.position.x - pose.pose.position.x;
+      double dsy = seg_end.pose.position.y - pose.pose.position.y;
+      double dist_to_end = std::hypot(dsx, dsy);
+      if (dist_to_end < goal_dist_tolerance_ &&
+          std::abs(u_prev_(0)) < goal_approach_vel_) {
+        current_segment_idx_++;
+        global_plan_ = plan_segments_[current_segment_idx_];
+        // Reset the monotonic progress tracker together with the plan, as in
+        // handle_goal().
+        progress_idx_ = 0;
+        // Rotate in place toward the new segment's departure direction. While
+        // the dwell window lasts, the new segment's reference clamps at its
+        // first pose (departure stamp still in the future), so after aligning
+        // the robot simply holds until the plan says to leave; any rotation
+        // overrun beyond the dwell shows up as temporal error the MPC
+        // recovers downstream.
+        control_phase_ = ControlPhase::INITIAL_ROTATION;
+        RCLCPP_INFO(get_logger(),
+                    "Cusp vertex reached (%.3f m off, v=%.2f m/s). Starting "
+                    "segment %zu/%zu with an in-place rotation.",
+                    dist_to_end, u_prev_(0), current_segment_idx_ + 1,
+                    plan_segments_.size());
+      }
       return;
     }
 
@@ -789,6 +857,173 @@ geometry_msgs::msg::PoseStamped MPCController::get_robot_pose() {
   }
 
   return pose;
+}
+
+// ----- CUSP SPLITTING -----
+std::vector<nav_msgs::msg::Path>
+MPCController::split_path_at_cusps(const nav_msgs::msg::Path &original_path) {
+  std::vector<nav_msgs::msg::Path> segments;
+
+  const auto &poses = original_path.poses;
+  if (poses.size() < 3 || cusp_angle_threshold_ >= M_PI) {
+    segments.push_back(original_path);
+    return segments;
+  }
+
+  // Steps shorter than this are wait actions (repeated vertices with
+  // advancing stamps) and do not define a direction of motion.
+  constexpr double kMotionEps = 1e-3; // m
+
+  auto set_yaw = [](geometry_msgs::msg::PoseStamped &p, double yaw) {
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, yaw);
+    p.pose.orientation = tf2::toMsg(q);
+  };
+
+  // Materialize poses[first..last] (inclusive).
+  auto make_segment = [&](size_t first, size_t last) {
+    nav_msgs::msg::Path seg;
+    seg.header = original_path.header;
+    seg.poses.assign(poses.begin() + first, poses.begin() + last + 1);
+    return seg;
+  };
+
+  size_t seg_start = 0;         // first pose of the segment being built
+  size_t last_motion_start = 0; // pose the most recent motion step left from
+  size_t last_motion_end = 0;   // pose the most recent motion step arrived at
+  double prev_dir = 0.0;        // direction of that motion step
+  bool have_dir = false;
+  bool entry_patch = false; // current segment starts at a cusp departure
+  double entry_dir = 0.0;   // outgoing direction at that departure
+  bool entry_stamp_patch = false; // departure stamp was delayed by a borrow
+  rclcpp::Time entry_stamp;       // the delayed departure stamp
+
+  // Walk the raw waypoints comparing directions of consecutive motion steps.
+  // At a cusp, the incoming segment ends at the pose where the previous
+  // motion ARRIVED (arrival stamp) and the outgoing segment starts at the
+  // pose the new motion LEAVES from (departure stamp). Wait poses in between
+  // belong to neither segment; together with the symmetric borrow applied
+  // below they form the dwell window the control loop spends rotating in
+  // place. Boundary orientations around the cusp are overwritten with the
+  // motion direction so that (a) the alignment rotation into the next segment
+  // has a well-defined target even if the planner left waypoint orientations
+  // unset, and (b) the reference the MPC holds while dwelling on the vertex
+  // matches the heading the robot arrives with.
+  for (size_t i = 0; i + 1 < poses.size(); ++i) {
+    double dx = poses[i + 1].pose.position.x - poses[i].pose.position.x;
+    double dy = poses[i + 1].pose.position.y - poses[i].pose.position.y;
+    if (std::hypot(dx, dy) < kMotionEps) {
+      continue; // wait step
+    }
+    double dir = std::atan2(dy, dx);
+
+    if (have_dir) {
+      double diff = std::abs(std::remainder(dir - prev_dir, 2.0 * M_PI));
+      if (diff > cusp_angle_threshold_) {
+        rclcpp::Time t_arr(poses[last_motion_end].header.stamp); // arrival
+        rclcpp::Time t_dep(poses[i].header.stamp);               // departure
+        double dwell = (t_dep - t_arr).seconds();
+        double rotation_time = diff / (0.8 * max_angular_vel_);
+
+        // The planner distributes timestamps homogeneously and models no
+        // rotation kinematics, so in general dwell < rotation_time. The
+        // executor synthesizes the missing dwell itself: it borrows
+        // deficit/2 from EACH of the two plan intervals adjacent to the
+        // reversal vertex (arrive early by `borrow`, depart late by
+        // `borrow`), spreading the stop symmetrically around the vertex
+        // stamp so the arrival and departure speeds stay equal. Every other
+        // waypoint stamp is untouched: the speed-up is confined to the cells
+        // the plan already assigns the robot around the vertex, so it cannot
+        // interfere with the collision guarantees of the original plan. The
+        // borrow is capped so the compressed reference speed never exceeds
+        // max_linear_vel_; any remaining deficit is borrowed at runtime and
+        // repaid downstream by the temporal-error dynamics.
+        double deficit = std::max(0.0, rotation_time - dwell);
+        double borrow = 0.0;
+        if (deficit > 0.0 && max_linear_vel_ > 0.0) {
+          rclcpp::Time t_in_start(poses[last_motion_start].header.stamp);
+          if (entry_stamp_patch && last_motion_start == seg_start) {
+            // Consecutive cusps share this interval: the previous cusp
+            // already delayed this segment's departure stamp.
+            t_in_start = entry_stamp;
+          }
+          double d_in =
+              std::hypot(poses[last_motion_end].pose.position.x -
+                             poses[last_motion_start].pose.position.x,
+                         poses[last_motion_end].pose.position.y -
+                             poses[last_motion_start].pose.position.y);
+          double margin_in =
+              (t_arr - t_in_start).seconds() - d_in / max_linear_vel_;
+
+          rclcpp::Time t_out_end(poses[i + 1].header.stamp);
+          double d_out = std::hypot(
+              poses[i + 1].pose.position.x - poses[i].pose.position.x,
+              poses[i + 1].pose.position.y - poses[i].pose.position.y);
+          double margin_out =
+              (t_out_end - t_dep).seconds() - d_out / max_linear_vel_;
+
+          borrow =
+              std::max(0.0, std::min({deficit / 2.0, margin_in, margin_out}));
+        }
+
+        // Close the incoming segment at its arrival pose on the cusp vertex,
+        // shifted `borrow` seconds early.
+        auto seg = make_segment(seg_start, last_motion_end);
+        if (entry_patch) {
+          set_yaw(seg.poses.front(), entry_dir);
+        }
+        if (entry_stamp_patch) {
+          seg.poses.front().header.stamp =
+              static_cast<builtin_interfaces::msg::Time>(entry_stamp);
+        }
+        set_yaw(seg.poses.back(), prev_dir);
+        if (borrow > 0.0) {
+          seg.poses.back().header.stamp =
+              static_cast<builtin_interfaces::msg::Time>(
+                  t_arr - rclcpp::Duration::from_seconds(borrow));
+        }
+        segments.push_back(std::move(seg));
+
+        double window = dwell + 2.0 * borrow;
+        RCLCPP_INFO(get_logger(),
+                    "Cusp at (%.2f, %.2f): %.0f deg reversal, plan dwell "
+                    "%.2f s, rotation needs ~%.2f s, borrowed %.2f s/side "
+                    "from adjacent intervals -> window %.2f s (%s)",
+                    poses[i].pose.position.x, poses[i].pose.position.y,
+                    diff * 180.0 / M_PI, dwell, rotation_time, borrow, window,
+                    window + 1e-9 >= rotation_time
+                        ? "feasible"
+                        : "still short; remainder repaid at runtime");
+
+        seg_start = i;
+        entry_patch = true;
+        entry_dir = dir;
+        entry_stamp_patch = borrow > 0.0;
+        if (entry_stamp_patch) {
+          entry_stamp = t_dep + rclcpp::Duration::from_seconds(borrow);
+        }
+      }
+    }
+
+    prev_dir = dir;
+    have_dir = true;
+    last_motion_start = i;
+    last_motion_end = i + 1;
+  }
+
+  // Final segment up to the end of the plan (its last pose keeps the goal
+  // orientation resolved in handle_goal()).
+  auto seg = make_segment(seg_start, poses.size() - 1);
+  if (entry_patch) {
+    set_yaw(seg.poses.front(), entry_dir);
+  }
+  if (entry_stamp_patch) {
+    seg.poses.front().header.stamp =
+        static_cast<builtin_interfaces::msg::Time>(entry_stamp);
+  }
+  segments.push_back(std::move(seg));
+
+  return segments;
 }
 
 // ----- PATH INTERPOLATION -----
@@ -972,39 +1207,15 @@ MPCController::smooth_path(const nav_msgs::msg::Path &original_path,
 
 // ----- PATH RESAMPLING AND RETIMING -----
 nav_msgs::msg::Path MPCController::resample_and_retime_path(
-    const nav_msgs::msg::Path &interpolated_path,
     const nav_msgs::msg::Path &smoothed_path, double spacing) {
-  if (smoothed_path.poses.size() < 2 || interpolated_path.poses.size() < 2) {
+  if (smoothed_path.poses.size() < 2) {
     return smoothed_path;
   }
 
   RCLCPP_INFO(get_logger(), "Resampling and retiming path with spacing: %.2fm",
               spacing);
 
-  // 1. Build Distance -> Time lookup from interpolated_path (source of truth
-  // for time)
-  std::vector<double> orig_dists;
-  std::vector<double> orig_times;
-  orig_dists.push_back(0.0);
-
-  rclcpp::Time t0(interpolated_path.poses.front().header.stamp);
-  orig_times.push_back(0.0); // Relative time
-
-  for (size_t i = 0; i < interpolated_path.poses.size() - 1; ++i) {
-    double dx = interpolated_path.poses[i + 1].pose.position.x -
-                interpolated_path.poses[i].pose.position.x;
-    double dy = interpolated_path.poses[i + 1].pose.position.y -
-                interpolated_path.poses[i].pose.position.y;
-    double d = std::hypot(dx, dy);
-    orig_dists.push_back(orig_dists.back() + d);
-
-    rclcpp::Time ti(interpolated_path.poses[i + 1].header.stamp);
-    orig_times.push_back((ti - t0).seconds());
-  }
-
-  double total_orig_dist = orig_dists.back();
-
-  // 2. Calculate total length of smoothed_path (geometry)
+  // 1. Calculate total length of smoothed_path (geometry)
   std::vector<double> smooth_dists;
   smooth_dists.push_back(0.0);
   for (size_t i = 0; i < smoothed_path.poses.size() - 1; ++i) {
@@ -1017,14 +1228,13 @@ nav_msgs::msg::Path MPCController::resample_and_retime_path(
   }
   double total_smooth_dist = smooth_dists.back();
 
-  // 3. Resample smoothed path at fixed spacing
+  // 2. Resample smoothed path at fixed spacing
   nav_msgs::msg::Path final_path;
   final_path.header = smoothed_path.header;
 
-  // Add start point exactly
+  // Add start point exactly (smooth_path keeps it untouched, so it already
+  // carries the plan's first timestamp)
   final_path.poses.push_back(smoothed_path.poses.front());
-  final_path.poses.back().header.stamp =
-      interpolated_path.poses.front().header.stamp;
 
   double current_dist = spacing;
   size_t current_idx = 0; // Index in smoothed_path
@@ -1067,40 +1277,29 @@ nav_msgs::msg::Path MPCController::resample_and_retime_path(
     q.setRPY(0, 0, tangent_theta);
     new_pose.pose.orientation = tf2::toMsg(q);
 
-    // Map Distance to Time
-    // Normalize distance to [0, 1] relative to smoothed total length
-    // Then map to original total length to look up time
-    // This assumes uniform stretching/shrinking of the path geometry
-    double normalized_dist = current_dist / total_smooth_dist;
-    double lookup_dist = normalized_dist * total_orig_dist;
-
-    // Lookup time in orig_dists/orig_times
-    auto it =
-        std::lower_bound(orig_dists.begin(), orig_dists.end(), lookup_dist);
-    size_t t_idx = std::distance(orig_dists.begin(), it);
-    if (t_idx == 0)
-      t_idx = 1;
-    if (t_idx >= orig_dists.size())
-      t_idx = orig_dists.size() - 1;
-
-    double t_ratio = (lookup_dist - orig_dists[t_idx - 1]) /
-                     (orig_dists[t_idx] - orig_dists[t_idx - 1]);
-    double relative_time =
-        orig_times[t_idx - 1] +
-        t_ratio * (orig_times[t_idx] - orig_times[t_idx - 1]);
-
+    // Map distance to time LOCALLY: smooth_path() is index-preserving and
+    // carries every pose's plan timestamp through, so the stamps of the two
+    // bracketing smoothed poses bound this sample's time. Interpolating
+    // within the bracket preserves the plan's local time structure
+    // (per-waypoint speeds, waits) instead of smearing it over the whole path
+    // with a global distance normalisation -- which also broke down at
+    // reversals and waits, where time advances at zero arc length. Where
+    // smoothing shortens the geometry (corner cutting), the same plan time
+    // spans a slightly shorter arc and the reference naturally slows down at
+    // the corner.
+    rclcpp::Time t1(p1.header.stamp);
+    rclcpp::Time t2(p2.header.stamp);
     new_pose.header.stamp = static_cast<builtin_interfaces::msg::Time>(
-        t0 + rclcpp::Duration::from_seconds(relative_time));
+        t1 + rclcpp::Duration::from_seconds(ratio * (t2 - t1).seconds()));
 
     final_path.poses.push_back(new_pose);
 
     current_dist += spacing;
   }
 
-  // Add end point exactly
+  // Add end point exactly (smooth_path keeps it untouched, so it already
+  // carries the plan's exact end timestamp)
   final_path.poses.push_back(smoothed_path.poses.back());
-  final_path.poses.back().header.stamp =
-      interpolated_path.poses.back().header.stamp; // Exact end time
 
   RCLCPP_INFO(get_logger(), "Resampled path: %zu -> %zu poses",
               smoothed_path.poses.size(), final_path.poses.size());
@@ -1110,11 +1309,43 @@ nav_msgs::msg::Path MPCController::resample_and_retime_path(
 
 // ----- TEMPORAL REFERENCE CALCULATION -----
 geometry_msgs::msg::PoseStamped
-MPCController::get_temporal_reference(const rclcpp::Time &target_time) {
+MPCController::get_temporal_reference(const rclcpp::Time &requested_time) {
   geometry_msgs::msg::PoseStamped reference;
 
   if (global_plan_.poses.empty()) {
     return reference;
+  }
+
+  // Anti-windup on the temporal reference: bound its spatial lead over the
+  // robot's actual progress on the plan (progress_idx_, maintained by
+  // calculate_temporal_error every cycle). The MPC linearizes its input map
+  // around the reference orientation, which is only valid near the reference;
+  // if the robot falls behind (e.g. an in-place cusp rotation that had to
+  // borrow schedule time), an unbounded reference keeps racing ahead, drags
+  // the linearization out of its validity region (observed as saturated
+  // pirouetting) and invites corner cutting. Clamping the lookup time to the
+  // stamp of the pose max_reference_lead_ metres ahead of the matched
+  // progress keeps the tracking problem well-posed; the schedule lag is still
+  // measured against the ORIGINAL stamps by calculate_temporal_error, so the
+  // reported temporal error stays honest and the clamp releases itself as the
+  // robot advances and catches up.
+  rclcpp::Time target_time = requested_time;
+  if (max_reference_lead_ > 0.0) {
+    const auto &poses = global_plan_.poses;
+    size_t lead_idx = progress_idx_;
+    double arc = 0.0;
+    while (lead_idx + 1 < poses.size() && arc < max_reference_lead_) {
+      double dx = poses[lead_idx + 1].pose.position.x -
+                  poses[lead_idx].pose.position.x;
+      double dy = poses[lead_idx + 1].pose.position.y -
+                  poses[lead_idx].pose.position.y;
+      arc += std::hypot(dx, dy);
+      ++lead_idx;
+    }
+    rclcpp::Time lead_time(poses[lead_idx].header.stamp);
+    if (target_time > lead_time) {
+      target_time = lead_time;
+    }
   }
 
   // If target time is before the first pose, return first pose
@@ -1751,6 +1982,8 @@ void MPCController::reset_state(bool success) {
   }
 
   global_plan_.poses.clear();
+  plan_segments_.clear();
+  current_segment_idx_ = 0;
   u_prev_ = Eigen::Vector2d::Zero();
   progress_idx_ = 0;
   current_goal_handle_.reset();
@@ -1801,15 +2034,17 @@ void MPCController::build_mpc_matrices(
   const int dim_u = nu;
   const int dim_aug = dim_x + dim_u; // 6
 
-  // Linearized dynamics around reference trajectory
-  // Use the first reference for linearization
-  Eigen::Vector4d ref_state = reference_trajectory.empty()
-                                  ? Eigen::Vector4d::Zero()
-                                  : reference_trajectory[0];
-
-  // Extract sin and cos components for linearization
-  double s_ref = ref_state(2); // sin(theta_ref)
-  double c_ref = ref_state(3); // cos(theta_ref)
+  // Linearize the input map around the CURRENT state orientation: v advances
+  // the robot along ITS heading and omega rotates ITS orientation vector.
+  // Near the reference this coincides with linearizing around the reference
+  // orientation (the previous behavior, s,c ~ s_ref,c_ref), so the
+  // well-tracked regime is unchanged. Far from the reference, however, the
+  // reference orientation flips the sign of the orientation->position channel
+  // (e.g. robot at yaw ~95 deg with cos<0 while the reference tangent has
+  // cos>0): the dominant position weight then drags omega to saturation and
+  // the robot pirouettes instead of driving back to the path.
+  double s_ref = current_state(2); // sin(theta)
+  double c_ref = current_state(3); // cos(theta)
 
   // ====================================================
   // Linearized dynamics with sin/cos representation

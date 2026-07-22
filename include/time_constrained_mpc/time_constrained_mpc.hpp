@@ -61,9 +61,25 @@ public:
   nav_msgs::msg::Path smooth_path(const nav_msgs::msg::Path &original_path,
                                   double smoothing_window = 0.5);
   nav_msgs::msg::Path
-  resample_and_retime_path(const nav_msgs::msg::Path &interpolated_path,
-                           const nav_msgs::msg::Path &smoothed_path,
+  resample_and_retime_path(const nav_msgs::msg::Path &smoothed_path,
                            double spacing = 0.1);
+  // Split the timestamped plan at direction reversals (cusps). A reversal is
+  // kinematically feasible for a differential robot, but only through a stop
+  // and an in-place rotation, which no averaging smoother can represent. Each
+  // returned monotone segment is therefore smoothed and tracked on its own,
+  // and the reversal is executed as a timed rotation between segments (see
+  // the segment handover in control_loop()). The planner's homogeneous
+  // timestamps allocate no time for the rotation, so the splitter synthesizes
+  // the dwell window: it shifts the vertex's arrival stamp earlier and its
+  // departure stamp later by half the rotation deficit each (capped so the
+  // compressed reference speed on the two adjacent plan intervals stays
+  // within max_linear_vel_), spreading the stop symmetrically around the
+  // vertex stamp. All other waypoint stamps are untouched, which confines the
+  // speed changes to the cells adjacent to the vertex and so preserves the
+  // collision guarantees of the original plan. Plan wait poses at the vertex
+  // (assigned to neither segment) extend the window for free.
+  std::vector<nav_msgs::msg::Path>
+  split_path_at_cusps(const nav_msgs::msg::Path &original_path);
 
   // Temporal reference calculation
   geometry_msgs::msg::PoseStamped
@@ -169,7 +185,14 @@ private:
   bool bond_timeout_detected_{false};
 
   // State variables
-  nav_msgs::msg::Path global_plan_;
+  nav_msgs::msg::Path global_plan_; // segment currently being tracked
+  // The plan split at direction reversals (see split_path_at_cusps):
+  // global_plan_ always holds plan_segments_[current_segment_idx_]. Segments
+  // are executed in order, with an in-place rotation (INITIAL_ROTATION)
+  // between consecutive ones, scheduled into the dwell window between one
+  // segment's arrival stamp and the next segment's departure stamp.
+  std::vector<nav_msgs::msg::Path> plan_segments_;
+  size_t current_segment_idx_{0};
   rclcpp::Time path_start_time_; // Time when path execution started
   // World anchor for the terminal approach reference, captured when the
   // GOAL_APPROACH phase begins: the wall time at entry and the robot's
@@ -221,8 +244,15 @@ private:
   double progress_search_window_; // Forward look-ahead (m) for the monotonic
                                   // progress-index argmin in
                                   // calculate_temporal_error()
+  double max_reference_lead_;     // Anti-windup: max spatial lead (m) of the
+                                  // temporal reference over the robot's
+                                  // matched progress (<= 0 disables). See
+                                  // get_temporal_reference()
   bool use_stamped_cmd_vel_;     // Use TwistStamped (true) or Twist (false)
   double path_smoothing_window_; // Smoothing window in meters
+  double cusp_angle_threshold_;  // rad; direction change between consecutive
+                                 // plan motion steps above this is a cusp and
+                                 // splits the plan (>= pi disables splitting)
   bool debug_mpc_;               // Enable MPC debugging output
   bool use_bond_;                // Enable bond usage
 
