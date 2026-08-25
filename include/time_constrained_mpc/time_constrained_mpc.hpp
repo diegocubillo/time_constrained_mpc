@@ -8,6 +8,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "osqp/osqp.h"
 #include "rclcpp/publisher.hpp"
+#include "rclcpp/create_timer.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"

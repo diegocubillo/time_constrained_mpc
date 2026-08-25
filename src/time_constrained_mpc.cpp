@@ -186,11 +186,30 @@ MPCController::on_configure(const rclcpp_lifecycle::State & /*state*/) {
       });
 
   // Create timers but keep them paused (will be activated in on_activate)
-  timer_control_loop_ =
-      this->create_wall_timer(std::chrono::milliseconds(100),
-                              std::bind(&MPCController::control_loop, this));
+  //
+  // The control loop runs on the NODE CLOCK, not on the steady clock, and its
+  // period is d_t_ = 1/controller_frequency -- the very step the model is
+  // discretized with. Two reasons:
+  //   - Consistency: the temporal reference is indexed with this->now(), so
+  //     loop and reference must advance on the same time base. A wall timer
+  //     under use_sim_time and a simulator below 100% real time fires more
+  //     often per simulated second than the model assumes, which both breaks
+  //     the discretization and hands this controller more control cycles than
+  //     a baseline whose loop does honour simulated time.
+  //   - On the robot (use_sim_time=false) the node clock IS that machine's
+  //     system clock, which advances at the same rate as the steady clock, so
+  //     the real-time behaviour is unchanged as long as NTP/chrony slews
+  //     instead of stepping (it only steps at boot).
+  // The QP solve time is still measured with std::chrono::steady_clock in
+  // solve_mpc(): that deadline is a property of real computation and must not
+  // follow simulated time.
+  timer_control_loop_ = rclcpp::create_timer(
+      this, this->get_clock(), rclcpp::Duration::from_seconds(d_t_),
+      std::bind(&MPCController::control_loop, this));
   timer_control_loop_->cancel();
 
+  // Visualization only (republishes the global plan for RViz); left on the
+  // steady clock on purpose, since nothing is measured from it.
   timer_path_pub_ = this->create_wall_timer(
       std::chrono::seconds(1),
       std::bind(&MPCController::publish_debug_path, this));
